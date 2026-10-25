@@ -1,0 +1,41 @@
+// opencode2api 配置模板（JSONC：支持 // 行注释，注释行在 render 时会被丢弃）
+//
+// 由 scripts/poolctl.py render 读取 accounts.yaml + .env 后用 json.dump 生成
+// opencode2api/config.json（无注释的纯 JSON）。
+//
+// 重要：opencode2api 拒绝未知字段 —— 只保留下面这些已核实字段，不要添加
+// warp / reasoning / rotation 等猜测字段（确需实验时请先注释掉）。
+//
+// 字段占位符：
+//   {{OC2API_SERVER_KEY}}       CPA -> opencode2api 认证 key
+//   {{OC2API_WEBUI_USER}}       WebUI 用户名
+//   {{OC2API_WEBUI_PASSWORD}}   WebUI 密码（>=10 字符）
+//   go_keys / proxies           由 accounts.yaml 的 opencode_go_pool 填充
+{
+  "listen": "0.0.0.0:8080",
+  "server_keys": ["{{OC2API_SERVER_KEY}}"],
+  "zen_keys": [],
+  "go_keys": [],            // render 填充 opencode_go_pool.keys
+  "anonymous": false,       // 必须为 false：关闭免费通道探测防 IP 级 403 abuse
+  "proxies": [],            // render 填充 opencode_go_pool.proxies（["direct"] 或静态代理，禁 #pool）
+  "prefer": "go",
+  "upstream": {
+    "zen": "https://opencode.ai/zen",
+    "go": "https://opencode.ai/zen/go",
+    "anonymous": "https://opencode.ai/inference"
+  },
+  "retry": {"max_attempts": 3, "timeout_seconds": 300},
+  "models": {"refresh_seconds": 300, "protocols": {}, "free_only": false},
+  "performance": {
+    "max_idle_conns": 2048, "max_idle_conns_per_host": 256, "max_conns_per_host": 0,
+    "idle_conn_timeout_seconds": 120, "connect_timeout_seconds": 5,
+    "failure_cooldown_seconds": 15, "attempt_timeout_seconds": 0,
+    "first_event_timeout_seconds": 0, "max_anonymous_exits": 8, "free_tier_block_seconds": 900
+  },
+  "logging": {"level": "info", "ring_size": 2000, "dump_request_bodies": false},
+  "webui": {
+    "enabled": true, "listen": "0.0.0.0:8081",
+    "username": "{{OC2API_WEBUI_USER}}", "password": "{{OC2API_WEBUI_PASSWORD}}",
+    "session_ttl_minutes": 720
+  }
+}

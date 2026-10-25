@@ -1,0 +1,115 @@
+# =============================================================================
+# CLIProxyAPI (CPA) v8 配置模板 —— poolctl render 的目标结构参考
+# =============================================================================
+#
+# 用法说明：
+#   1. 本文件是【文档性参考 + 手工部署兜底】。正常流程由 scripts/poolctl.py render
+#      读取 accounts.yaml + .env，用 PyYAML 直接构造 dict 再 dump 出
+#      cliproxy/config.yaml，不经过本模板的字符串替换。
+#   2. 若手工部署，可复制本文件为 cliproxy/config.yaml，再把所有 {{PLACEHOLDER}}
+#      文本占位符替换为真实值（不是 jinja，纯文本替换）。
+#   3. 字段名严格对应 CPA v8 schema，不要重命名/杜撰字段；未知字段会被拒绝或忽略。
+#
+# 占位符清单：
+#   {{MASTER_API_KEY}}       客户端访问 CPA 的主 Key（.env: MASTER_API_KEY）
+#   {{CPA_ADMIN_SECRET}}     management.secret-key / CPAMC 面板登录密码（.env: CPA_ADMIN_SECRET）
+#   {{OC2API_SERVER_KEY}}    CPA -> opencode2api 的内网 server_key（.env: OC2API_SERVER_KEY）
+#
+# 关于 oauth.model-alias：
+#   name  是【上游 Devin 模型 ID】，不含 "devin/" 前缀 —— 前缀由 provider 层自动注入，
+#         alias 才是客户端看到的模型名。
+#
+# 关于 oauth.providers.devin.sensitive-words：
+#   默认空列表 [] = 关闭零宽混淆。由 accounts.yaml 的 devin_pool.sensitive_words 控制：
+#   enabled=false 时 render 出 []；enabled=true 时 render 出内置词表 + extra 的合并结果。
+#
+# 关于 api-keys.openai-compatibility[].keys：
+#   render 时填充。opencode-go-pool 只需一条内网网关 key；command-code-goat 每个 GOAT
+#   key 一条，weight 取自 accounts.yaml。
+#
+# =============================================================================
+
+config-version: 8
+
+server:
+  host: ""
+  port: 8317
+
+management:
+  allow-remote: true
+  secret-key: "{{CPA_ADMIN_SECRET}}"
+
+access:
+  api-keys:
+    - "{{MASTER_API_KEY}}"
+
+routing:
+  strategy: "weighted-round-robin"
+  session-affinity: true
+  session-affinity-ttl: "2h"
+  session-affinity-subagents: false
+  retry:
+    request-retry: 3
+    max-retry-credentials: 0
+    max-retry-interval: 30
+  cooldown:
+    disable-cooling: false
+    save-cooldown-status: true
+    transient-error-cooldown-seconds: 60
+
+requests:
+  passthrough-headers: false
+
+observability:
+  usage:
+    usage-statistics-enabled: true
+
+oauth:
+  auth-dir: "/root/.cli-proxy-api"
+  model-alias:
+    devin:
+      - name: "swe-2"
+        alias: "brain-swe2"
+      # 注：Devin 付费快速档真实模型 ID 为 swe-2-lightning（CPA 上游目录核实，
+      # "swe-2-fast" 是不存在的臆造 ID，勿改回）
+      - name: "swe-2-lightning"
+        alias: "brain-swe2-fast"
+      - name: "gemini-4-argon"
+        alias: "brain-argon"
+  request-scoped-errors:
+    devin:
+      - status: 429
+        match: ["Reached free model rate limit", "resource_exhausted"]
+        action: "continue-and-cooldown"
+      - status: 500
+        match: ["Reached free model rate limit", "resource_exhausted"]
+        action: "continue-and-cooldown"
+  providers:
+    devin:
+      # 开关：填入词表即启用零宽混淆；空列表 = 关闭
+      sensitive-words: []
+
+api-keys:
+  openai-compatibility:
+    - name: "opencode-go-pool"
+      base-url: "http://opencode2api:8080/v1"
+      support-prompt-cache-key: true
+      models:
+        - name: "deepseek-v4.1-flash"
+          alias: "worker-ds41"
+        - name: "kimi-k3"
+          alias: "brain-kimi-k3-fallback"
+        - name: "gemini-4-argon"
+          alias: "brain-argon"
+      # render 填充：{api-key: "{{OC2API_SERVER_KEY}}", weight: 1} 一条即可（内网网关单 key）
+      keys: []
+    - name: "command-code-goat"
+      base-url: "https://api.commandcode.ai/provider/v1"
+      support-prompt-cache-key: true
+      models:
+        - name: "deepseek/deepseek-v4.1-flash"
+          alias: "worker-ds41"
+        - name: "kimi-k3"
+          alias: "brain-kimi-k3-fallback"
+      # render 填充每个 GOAT key: {api-key, weight}
+      keys: []

@@ -1,0 +1,19 @@
+# 密钥与真实号池清单
+.env
+accounts.yaml
+
+# render 产物（example 文件不受影响：config.yaml.example / config.json.example）
+cliproxy/auths/*.json
+cliproxy/config.yaml
+cliproxy/logs/
+opencode2api/config.json
+
+# 客户端导出
+export/
+
+# Python
+__pycache__/
+*.pyc
+
+# 系统
+.DS_Store

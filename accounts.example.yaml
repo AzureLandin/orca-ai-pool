@@ -1,0 +1,51 @@
+# orca-ai-pool 号池清单 —— 复制为 accounts.yaml 后填写。
+# 该文件是唯一事实源：poolctl render 据此生成 CPA config、Devin 凭据与 opencode2api 配置。
+
+devin_pool:
+  # pro-only: 所有 Pro 均衡，weight=1，开放全部模型
+  # max-hybrid: Max weight=7 承接付费模型，Pro 仅跑免费 swe-2
+  mode: "pro-only"
+  # 敏感词零宽混淆开关（CPA 原生 oauth.providers.devin.sensitive-words）
+  # 开启后在 Devin 请求的提示词敏感词中插入零宽字符，降低上游关键词审计命中
+  sensitive_words:
+    enabled: false
+    # 自定义追加词表（会与内置词表合并）；内置词表见 README
+    extra: []
+  accounts:
+    - id: "devin-pro-1"            # 凭据文件名（不含扩展名）
+      email: "pro1@example.com"
+      plan: "Pro"                  # Pro | Max
+      weight: 1
+      session_token: "devin-session-token$REPLACE_WITH_TOKEN_1"
+    - id: "devin-pro-2"
+      email: "pro2@example.com"
+      plan: "Pro"
+      weight: 1
+      session_token: "devin-session-token$REPLACE_WITH_TOKEN_2"
+    # 扩容 Devin Max 时取消注释（weight 7 对应 Max:Pro = 7:1 额度比）：
+    # - id: "devin-max-1"
+    #   email: "max1@example.com"
+    #   plan: "Max"
+    #   weight: 7
+    #   session_token: "devin-session-token$REPLACE_WITH_MAX_TOKEN"
+
+opencode_go_pool:
+  # 4~5 个号保持 ["direct"]；6~10 个号可写 2~3 个静态 socks5://user:pass@ip:port
+  # 严禁在代理 URL 末尾加 #pool（必须是静态出口，保证 key 与 IP 固定绑定 + HTTP/2 keep-alive）
+  proxies:
+    - "direct"
+  keys:
+    - "oc_go_key_01_replace_me"
+    - "oc_go_key_02_replace_me"
+    - "oc_go_key_03_replace_me"
+    - "oc_go_key_04_replace_me"
+
+command_code_goat_pool:
+  # GOAT Provider API：https://api.commandcode.ai/provider/v1（API key 直连，非 OAuth）
+  keys:
+    - name: "goat-1"
+      api_key: "cc_goat_key_01_replace_me"
+      weight: 1
+    - name: "goat-2"
+      api_key: "cc_goat_key_02_replace_me"
+      weight: 1

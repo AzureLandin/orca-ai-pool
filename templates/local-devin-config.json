@@ -1,0 +1,7 @@
+{
+  "subagents": {
+    "enabled": false
+  },
+  "reasoningEffort": "high",
+  "fastMode": false
+}
