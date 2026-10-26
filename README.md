@@ -381,6 +381,10 @@ command_code_goat_pool:
 「Reached free model rate limit / resource_exhausted」的独立限流，已由
 `oauth.request-scoped-errors` 处理成「换号继续 + 该号冷却」。
 
+> 需要多少个号才够用？两人重度（多并发）的容量估算、缓存命中率敏感性、
+> Argon 的阶梯价与 SWE-2 免费状态的官方口径冲突，见
+> [`docs/capacity-planning.md`](docs/capacity-planning.md)。
+
 实时额度：
 
 ```bash
