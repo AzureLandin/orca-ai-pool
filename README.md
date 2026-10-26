@@ -1,22 +1,30 @@
 # orca-ai-pool
 
-AI 号池管理仓库：**CPA (CLIProxyAPI) 主网关 + opencode2api 副网关**，Docker Compose 部署在新加坡服务器。
-对外只暴露一个 OpenAI 兼容端点 `http://<server>:8317/v1`，内部把请求按模型名路由到 Devin (OAuth)、OpenCode Go、
-Command Code GOAT 三条上游，用「加权轮询 + 会话亲和」做负载均衡与缓存保护。
+AI 号池管理仓库：**nginx 限速入口 + CPA (CLIProxyAPI) 主网关 + opencode2api 副网关**，Docker Compose 部署在新加坡服务器。
+对外只暴露一个 OpenAI 兼容端点 `http://<server>:8317/v1`，由 nginx 入口转发给 CPA（模型调用**不限速**，
+只有 CPAMC 管理面按 IP 限速以挡口令爆破），内部再按模型名路由到
+Devin (OAuth)、OpenCode Go、Command Code GOAT 三条上游，用「加权轮询 + 会话亲和」做负载均衡与缓存保护。
+仓库还自带一个 CPA C ABI 插件（`plugin/opencode-go-quota`），把 OpenCode Go 各 key 的真实余量接进 CPAMC 配额页。
 
 ---
 
 ## 1. 架构
 
 ```
-                     ┌──────────────────────────────────────────────────────────────┐
-   本地 Orca / 客户端 │  Authorization: Bearer sk-orca-master-key                     │
-        (OpenAI API) └───────────────────────┬──────────────────────────────────────┘
-                                             │  http://<server>:8317/v1
-                                             ▼
+                          ┌────────────────────────────────────────────────────┐
+   本地 Orca / 客户端     │  Authorization: Bearer sk-orca-master-key          │
+        (OpenAI API)      └───────────────────────┬────────────────────────────┘
+                                                  │  http://<server>:8317/v1
+                                                  ▼
+                                    ┌──────────────────────────────┐
+                                    │  nginx ingress（唯一公网口）  │  /v1        不限速（透传）
+                                    │  :8317 SSE 透传 / 管理面限速  │  /v0/管理   10 r/min + burst 5
+                                    └───────────────┬──────────────┘  /management 共用同桶 burst 10
+                                                    │ orca-net（内网）
+                                                    ▼
                                  ┌───────────────────────┐
                                  │  cliproxyapi (CPA)    │  加权轮询 + 会话亲和
-                                 │  :8317  (唯一公网口)  │  usage 统计 / 冷却 / 重试
+                                 │  :8317 (仅内网可达)   │  usage 统计 / 冷却 / 重试
                                  └───┬───────┬───────┬───┘
                                      │       │       │
               ┌──────────────────────┘       │       └──────────────────────┐
@@ -40,8 +48,11 @@ Command Code GOAT 三条上游，用「加权轮询 + 会话亲和」做负载�
 | 上游 | 协议 | 凭据 | 作用 |
 |---|---|---|---|
 | Devin | OAuth session token | `cliproxy/auths/<id>.json` | 免费/Pro 模型主力（`swe-2` 系列、`gemini-4-argon`） |
-| opencode2api → OpenCode Go | OpenAI 兼容 | `go_keys` + 代理 | 高阶模型容量池（DS4.1F / Argon / Kimi K3） |
-| Command Code GOAT | OpenAI 兼容 | API key | 直连兜底，成本最低的 DS4.1F 与 Kimi K3 |
+| opencode2api → OpenCode Go | OpenAI 兼容 | `go_keys` + 代理 | DS4.1F 容量池（Argon 是 Google 原生协议，无法桥接，不进此池） |
+| Command Code GOAT | OpenAI 兼容 | API key | 直连兜底，成本最低的 DS4.1F |
+
+> `gemini-4-argon` 只能走 Devin OAuth：它上游是 Google 原生 `/inference/go/google/v1beta`，
+> opencode2api 只做 chat / responses / anthropic 三种协议转换，桥接不了（提交 `5723659` 把它移出了 Go 池）。
 
 ---
 
@@ -50,12 +61,20 @@ Command Code GOAT 三条上游，用「加权轮询 + 会话亲和」做负载�
 ```
 orca-ai-pool/
 ├── docker-compose.yml                    # 两服务 + orca-net + opencode2api-state 卷
+├── docker-compose.override.yml           # 叠加 nginx 入口：8317 归 ingress，CPA 退到 127.0.0.1:18317
+├── nginx/
+│   └── nginx.conf                        # 公网入口：/v1 透传不限速，仅管理面限速 + 429 JSON
+├── plugin/
+│   └── opencode-go-quota/                # 自研 CPA C ABI 插件（Go）：Go 池余量 → CPAMC 配额页
+│       ├── main.go
+│       ├── Makefile                      # make install → cliproxy/plugins/linux/amd64/
+│       └── go.mod / go.sum
 ├── .env.example                          # 部署参数（复制为 .env）
 ├── .gitignore
 ├── accounts.example.yaml                 # 号池清单（复制为 accounts.yaml）
 ├── README.md
 ├── scripts/
-│   └── poolctl.py                        # 唯一编排入口：render / check-opencode / quota / switch-mode / export-client
+│   └── poolctl.py                        # 唯一编排入口（5 个子命令）：render / check-opencode / quota / switch-mode / export-client
 ├── templates/
 │   ├── cliproxy.config.v8.yaml.tmpl      # CPA v8 配置结构参考（手工兜底）
 │   ├── opencode2api.config.json.tmpl     # opencode2api 配置结构参考（JSONC）
@@ -111,10 +130,13 @@ cp .env.example .env
 | `OC2API_SERVER_KEY` | CPA → opencode2api 内网 key | `openssl rand -hex 32` |
 | `OC2API_WEBUI_USER` | WebUI 用户名 | 自定 |
 | `OC2API_WEBUI_PASSWORD` | WebUI 密码，**≥10 字符** | `openssl rand -base64 18` |
+| `DISABLE_AUTH` | 设为 `true` 时 `access.api-keys` 输出空列表 = 客户端免鉴权。**只用于内网/测试**；生产保持 `false`，否则 8317 就是一个不设防的公网 LLM 出口 | 默认 `false` |
 
 ```bash
 chmod 600 .env
 ```
+
+> `DISABLE_AUTH` 不影响管理接口：`/v0/management` 仍要 `CPA_ADMIN_SECRET`（`secret-key` 置空会把管理端整段关掉，脚本不会这么做）。
 
 ### 3.4 填号池清单
 
@@ -132,15 +154,18 @@ python3 scripts/poolctl.py render
 
 产物：
 
-- `cliproxy/config.yaml` —— CPA v8 配置（占位符已替换）
+- `cliproxy/config.yaml` —— CPA v8 配置（占位符已替换，含 `plugins.configs` 段）
 - `cliproxy/auths/<id>.json` —— 每个 Devin 账号一个
+- `cliproxy/auths/opencode-go-pool.json` —— 给 `opencode-go-quota` 插件的池凭据（`type: "opencode-go"`）
 - `opencode2api/config.json` —— opencode2api 种子配置
 
 验证：
 
 ```bash
-grep -c "devin/" cliproxy/config.yaml     # 应为 0（alias 里不带 devin/ 前缀）
+grep -c "worker-ds41" cliproxy/config.yaml            # 应为 0：模型走真实 ID，旧的聚合别名已废弃
+grep -A4 "opencode-go-quota:" cliproxy/config.yaml     # 能看到 opencode_api_keys 列表 = 插件配置已生成
 python3 -c "import json;json.load(open('opencode2api/config.json'))"   # 纯 JSON 可解析
+ls cliproxy/plugins/linux/amd64/                       # 装了插件才有 opencode-go-quota.so
 ```
 
 ### 3.6 预检 OpenCode Go key
@@ -187,17 +212,21 @@ curl -s http://$HOST:8317/v1/chat/completions \
   -H "Authorization: Bearer $CPA_KEY" -H 'Content-Type: application/json' \
   -d '{"model":"deepseek-v4.1-flash","messages":[{"role":"user","content":"ping"}],"max_tokens":8}'
 
-# 冒烟：GOAT 直连（同 alias，CPA 轮询到 GOAT 上游时即为直连）
-curl -s http://$HOST:8317/v1/chat/completions \
-  -H "Authorization: Bearer $CPA_KEY" -H 'Content-Type: application/json' \
-  -d '{"model":"deepseek-v4.1-flash","messages":[{"role":"user","content":"ping"}],"max_tokens":8}'
+# 可选：同一个模型名打 20 次，观察 opencode-go-pool 与 command-code-goat 之间的轮询分布
+for i in $(seq 1 20); do
+  curl -s -o /dev/null -w '%{http_code} ' http://$HOST:8317/v1/chat/completions \
+    -H "Authorization: Bearer $CPA_KEY" -H 'Content-Type: application/json' \
+    -d '{"model":"deepseek-v4.1-flash","messages":[{"role":"user","content":"ping"}],"max_tokens":4}'
+done; echo
 ```
 
-三条都返回 `choices` 即部署完成。
+> `deepseek-v4.1-flash` 在 CPA 里由 **opencode-go-pool 与 command-code-goat 两个 provider 同名注册**，
+> 所以没有独立的"GOAT 冒烟"——两条上游由 `weighted-round-robin` 分流，任一成功即说明聚合生效。
+> 两段都返回 `choices` 即部署完成（第一条验证 Devin OAuth 链路，第二条验证 OpenAI 兼容聚合链路）。
 
 ### 3.9 防火墙
 
-只放行 `8317`。**8080 与 18081 都不要开**：
+只放行 `8317`（nginx 入口）。**8080 / 18081 / 18317 都不要开**：
 
 ```bash
 # ufw 示例
@@ -206,7 +235,50 @@ sudo ufw allow 8317/tcp
 sudo ufw enable
 ```
 
-WebUI 用 SSH 隧道访问：`ssh -L 18081:127.0.0.1:18081 user@server` → 本地开 `http://127.0.0.1:18081`。
+- `8080` 是 opencode2api 的 API，没有发布到宿主机（只在 `orca-net` 内被 CPA 访问）。
+- `18081` 只绑 `127.0.0.1`，用 SSH 隧道：`ssh -L 18081:127.0.0.1:18081 user@server` → 本地开 `http://127.0.0.1:18081`。
+- `18317` 是 CPA 的宿主机回环端口（见 3.10），用于绕过入口做排障（比如对比管理面 429），不要对公网开放。
+
+### 3.10 公网入口限速（nginx ingress）
+
+`docker-compose.override.yml` 会**自动叠加**到基础 compose 上（不需要 `-f`），拓扑变成：
+
+```
+公网 → nginx :8317（限速）→ cliproxyapi:8317（内网）
+宿主机 127.0.0.1:18317 → cliproxyapi:8317（绕过限速，仅排障）
+```
+
+CPAMC 管理口**按设计对公网开放**（`management.allow-remote: true`）。入口的设计原则是：
+
+> **只防管理面的口令爆破，不碰实际模型调用。**
+
+实际模型调用的速率由上游账号额度 + CPA 的会话亲和 / 冷却负责，入口不参与——多 agent 并行、
+长上下文连续调用都不会被入口掐掉。
+
+| 路径 | 限速 | 突发 | 并发上限 | 说明 |
+|---|---|---|---|---|
+| `/v1/*` | **不限速** | — | **不限** | 客户端 LLM 接口，纯透传；SSE 不开缓冲、读超时 3600s |
+| `/v0/management/*` | 10 r/min | 5 | 32/IP | 管理 API（`poolctl quota` 也走这里） |
+| `/management*` | 10 r/min | 10 | 32/IP | CPAMC 登录页与静态资源，**与上一行共用同一个桶** |
+| 其他 | 10 r/min | 5 | 32/IP | 管理入口兜底 |
+
+共用桶是有意为之：若按路径分别计数，攻击者先打 `/management` 再打 `/v0/management` 就能各拿一份 burst。
+现在所有管理入口共享 `orca_admin` 一个 zone，整体速率恒定在 ~0.17 次/秒/IP，口令爆破在速率上就不可行。
+
+超限返回 `429` + `Retry-After: 1` + JSON body（仅管理面会出现）：
+
+```json
+{"error":{"message":"management endpoint rate limited by orca-ai-pool ingress","type":"rate_limit_exceeded","code":"rate_limit_exceeded"}}
+```
+
+> `poolctl quota` 每次跑会连发 4~6 条管理请求，在 10 r/min + burst 5 下够用；
+> 若你加号后一次要刷十几个凭据，调大 `burst` 或改成 `rate=30r/m`。
+
+调参：改 `nginx/nginx.conf` 顶部的 `rate=` / `burst=`，然后 `docker compose restart ingress`。
+**回滚到"CPA 直接对外"**：`mv docker-compose.override.yml{,.disabled} && docker compose up -d`。
+
+> 入口日志只记方法/URI/状态/耗时（`log_format orca`），**不记录 `Authorization` 头**，避免 key 进日志。
+> 想再收紧管理口，可以打开 `location /v0/` 里注释掉的 `auth_basic` 段，加一层独立口令。
 
 ---
 
@@ -271,11 +343,16 @@ command_code_goat_pool:
 | `devin/gemini-4-argon` | Devin OAuth | 长上下文分析、架构评审 |
 | `deepseek-v4.1-flash` | OpenCode Go / GOAT | 批量代码生成、脏活累活，性价比最高 |
 
-> Devin 凭据的上游目录有几十个模型，`oauth.excluded-models` 按家族前缀收敛到这三个
-> （只支持通配符排除不支持白名单；新家族上线会漏进列表，需往 `DEVIN_EXCLUDED_MODELS` 补前缀）。
+> Devin 凭据的上游目录有几十个模型，`oauth.excluded-models` 按家族前缀收敛到上面三个
+> （`poolctl.py` 的 `DEVIN_EXCLUDED_MODELS`，排除 claude-*/gpt-*/gemini-3-*/kimi-*/swe-1-* 等；
+> 只支持通配符排除、不支持白名单，新家族上线会漏进列表，届时补一条前缀即可）。
 > GOAT 上游模型 ID 为 `deepseek/deepseek-v4.1-flash`，对外统一暴露 `deepseek-v4.1-flash`。
 > 同名模型出现在多个 provider 时，CPA 按 `weighted-round-robin` 在可用 provider 间分流，
 > 429/500 命中 `request-scoped-errors` 的匹配串会「继续 + 冷却」而非直接失败。
+>
+> `max-hybrid` 模式下 Pro 号会额外带上凭据级 `excluded_models`（付费模型 + 家族前缀）；
+> 注意**凭据级 excluded_models 会整表覆盖** `oauth.excluded-models`，所以 render 把两批前缀拼在一起写，
+> 否则 Pro 号在混合模式下反而会暴露全部 Devin 模型。
 
 ---
 
@@ -283,7 +360,7 @@ command_code_goat_pool:
 
 金额为「等效 API 用量额度」，不是现金。
 
-**OpenCode Go（单号 $10/月）**
+**OpenCode Go（订阅制，月付 $10 起，按账号实际套餐）**
 
 | 项目 | 额度 |
 |---|---|
@@ -313,7 +390,7 @@ python3 scripts/poolctl.py quota
 Devin 侧走 `POST /v0/management/auth-files/refresh` → `GET /v0/management/auth-files`
 读 `quota.signals`；OpenCode Go 侧走自研 `opencode-go-quota` 插件的
 `/v0/management/plugins/opencode-go-quota/quota`（逐 key rolling(5h)/weekly/monthly
-真实用量百分比，见第 10.5 节）；GOAT 侧仍为容量估算。
+真实用量百分比，见 10.1）；GOAT 侧仍为容量估算。
 
 ---
 
@@ -456,12 +533,15 @@ curl -s http://<server>:8317/v0/management/auth-files \
   -H "Authorization: Bearer $CPA_ADMIN_SECRET"
 ```
 
-> `allow-remote: true` 意味着管理口对公网开放（同 8317 端口）。若不想暴露，改成 `false`
-> 并只从容器内网 / SSH 隧道访问。
+> `allow-remote: true` 意味着管理口对公网开放（同 8317 端口）。**这是本仓库的预期设计**：
+> 公网可达性由 nginx 入口保留，风险由入口限速 + `CPA_ADMIN_SECRET` 承担（见 3.10）：
+> 所有管理路径共用 10 r/min + burst 5 的同一个桶，爆破在速率上就打不动；`/v1` 不限速。
+> 若某天想彻底关掉，改成 `false` 并只从容器内网 / SSH 隧道访问，同时把 override 里的
+> `18317` 回环端口一起收紧。
 
 ---
 
-## 10.5 OpenCode Go 多账号余量监控（自研 `opencode-go-quota` 插件）
+### 10.1 OpenCode Go 多账号余量监控（自研 `opencode-go-quota` 插件）
 
 仓库自带一个 CPA C ABI 插件（`plugin/opencode-go-quota/`，Go），实现 CPA 的
 **`AuthProvider` + `QuotaProvider`** 双能力：
@@ -497,7 +577,8 @@ docker compose restart cliproxyapi            # 插件只在 CPA 启动时加载
 
 ## 11. poolctl 用法
 
-`scripts/poolctl.py` 是唯一编排入口，六个子命令：
+`scripts/poolctl.py` 是唯一编排入口。注意 **CLI 只有五个子命令**（`render` / `check-opencode` / `quota` /
+`switch-mode` / `export-client`）；插件构建是 `make` 的活，不在 CLI 里：
 
 ### `render`
 
@@ -508,7 +589,8 @@ python3 scripts/poolctl.py render
 读 `accounts.yaml` + `.env`，写：
 
 - `cliproxy/auths/<id>.json`（每个 Devin 账号）
-- `cliproxy/config.yaml`（CPA v8）
+- `cliproxy/auths/opencode-go-pool.json`（插件池凭据，让 CPAMC 配额页出现综合卡片）
+- `cliproxy/config.yaml`（CPA v8，含 `plugins.configs.opencode-go-quota`）
 - `opencode2api/config.json`（种子配置）
 
 若 `opencode2api` 容器在跑，会额外 `docker compose cp` 进容器并调 `/api/config/reload`
@@ -552,18 +634,25 @@ python3 scripts/poolctl.py quota
 Devin：`POST /v0/management/auth-files/refresh` 触发刷新，再 `GET /v0/management/auth-files`
 读 `quota.signals`，打成配额表。
 OpenCode Go：调自研 `opencode-go-quota` 插件的 quota.fetch 端点取逐 key
-真实用量（rolling/weekly/monthly 剩余百分比 + 重置倒计时）。
-GOAT：按窗口用量打印容量估算表。
+真实用量（rolling / weekly / monthly 剩余百分比 + 重置倒计时），输出第二张表。
+GOAT：仍是按公开额度线性累加的**估算**表，不接实时接口。
 
-### 插件构建
+三张表的输出顺序：Devin 实时配额 → OpenCode Go 实时余量 → 执行池容量估算。
+
+### 插件构建（不是 CLI 子命令）
 
 ```bash
-cd plugin/opencode-go-quota && make install
+cd plugin/opencode-go-quota
+make          # CGO_ENABLED=1 go build -buildmode=c-shared
+make install  # → ../../cliproxy/plugins/linux/amd64/opencode-go-quota.so
+make test     # go vet ./...
 ```
 
-`CGO_ENABLED=1 go build -buildmode=c-shared` 编译 `opencode-go-quota.so`，
-安装到 `cliproxy/plugins/linux/amd64/`（compose 已挂载 `/CLIProxyAPI/plugins`）。
-装完 `render` + `docker compose restart cliproxyapi` 生效。
+依赖 Go 1.21+ 与 CGO（c-shared 产物）。`INSTALL_DIR` 可覆盖，默认
+`cliproxy/plugins/linux/amd64/`，compose 已把 `./cliproxy/plugins` 挂到 `/CLIProxyAPI/plugins`。
+装完 `render` + `docker compose restart cliproxyapi` 生效（**.so 只在 CPA 启动时加载**）。
+插件源在 `plugin/opencode-go-quota/`，与 `poolctl` 的耦合点只有一处：插件读
+`plugins.configs.opencode-go-quota.opencode_api_keys`，而 render 把 `opencode_go_pool.keys` 原样写进去。
 
 ### `switch-mode`
 
@@ -577,9 +666,10 @@ python3 scripts/poolctl.py switch-mode max-hybrid
 ### `export-client`
 
 ```bash
-python3 scripts/poolctl.py export-client          # 打印到 stdout
-python3 scripts/poolctl.py export-client --write  # 写 export/env.sh
+python3 scripts/poolctl.py export-client
 ```
+
+> 该子命令**总是**写 `export/env.sh`（权限 600）并同时打印到 stdout，没有 `--write` 开关。
 
 产物：
 
@@ -615,9 +705,33 @@ python3 scripts/poolctl.py export-client --write  # 写 export/env.sh
 ## 13. 故障排查 FAQ
 
 **Q1：`curl :8317/v1/models` 连不上？**
-`docker compose ps` 看两个服务是否 healthy；`docker compose logs cliproxyapi` 看是否因
-`config.yaml` 语法错误退出。`python3 -c "import yaml;yaml.safe_load(open('cliproxy/config.yaml'))"`
-先自检。
+先 `docker compose ps`：现在有 **三个**服务（`ingress` / `cliproxyapi` / `opencode2api`），全都要 healthy。
+然后分层排：
+
+```bash
+docker compose logs --tail 50 ingress       # nginx 配置/上游解析问题
+docker compose logs --tail 50 cliproxyapi   # config.yaml 语法错误会在这里退出
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:18317/v1/models   # 绕过入口
+python3 -c "import yaml;yaml.safe_load(open('cliproxy/config.yaml'))"
+```
+
+18317 通、8317 不通 → 问题在 ingress（看 `nginx -t` 与 `env` 里的 `resolver`）；
+两个都不通 → 问题在 CPA 本体。
+
+**Q11：`poolctl quota` 报 `HTTP 429` / 管理接口被限速？**
+这是入口的管理面限速（10 r/min + burst 5），不是 CPA 出问题。加号后一次刷十几个凭据会撞。
+处理：① 等一分钟重跑；② 把 `nginx/nginx.conf` 里 `orca_admin` 的 `rate=` 调到 30r/m、
+`/v0/` 的 `burst=` 调到 20，然后 `docker compose restart ingress`；
+③ 排障时可临时用 `127.0.0.1:18317` 直连 CPA 绕开入口。
+
+> `/v1`（模型调用）**不受任何入口限速影响**——如果你看到 `/v1` 返回 429，
+> body 里一定有上游限流特征（`Reached free model rate limit` / `resource_exhausted`），见 Q4 / Q9。
+
+**Q12：`poolctl quota` 报 "未发现 opencode-go 凭据"？**
+插件链路没走通，按顺序查：① `make install` 装过 `.so` 没有（`ls cliproxy/plugins/linux/amd64/`）；
+② `render` 后有没有 `docker compose restart cliproxyapi`（插件只在启动时加载）；
+③ `accounts.yaml` 里 `monitoring.enabled` 是不是被关成 `false`（关了就不输出 `plugins` 段）；
+④ `docker compose logs cliproxyapi | grep -i plugin` 看加载失败原因。
 
 **Q2：改了 `opencode2api/config.json` 但行为没变？**
 这是最常见的坑。opencode2api **只在 state 卷为空时**导入种子。必须走

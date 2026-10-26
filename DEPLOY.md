@@ -22,6 +22,7 @@ cp .env.example .env && vim .env
 | `OC2API_SERVER_KEY` | CPA→opencode2api 内网认证 key | `openssl rand -hex 24` |
 | `OC2API_WEBUI_USER` | opencode2api WebUI 用户名 | `admin` |
 | `OC2API_WEBUI_PASSWORD` | WebUI 密码（≥10字符） | `openssl rand -hex 12` |
+| `DISABLE_AUTH` | 客户端是否免鉴权，生产**必须** `false` | 保持默认 `false` |
 
 生成示例（在本机跑，把输出填进 .env）：
 
@@ -69,20 +70,29 @@ python3 scripts/poolctl.py render
 python3 scripts/poolctl.py check-opencode
 
 # 3. 构建余量监控插件（opencode-go-quota.so → cliproxy/plugins/linux/amd64/）
+#    需要 Go 1.21+ 与 CGO；没有插件也能跑主网关，只是 CPAMC 少一张 Go 余量卡
 cd plugin/opencode-go-quota && make install && cd ../..
 
-# 4. 起栈
+# 4. 起栈（docker compose 会自动叠加 docker-compose.override.yml → 带 nginx 入口）
 docker compose up -d
 
 # 5. 验证（30 秒后）
-docker compose ps
+docker compose ps      # 三个服务：ingress / cliproxyapi / opencode2api
 curl -s http://127.0.0.1:8317/v1/models \
   -H "Authorization: Bearer <MASTER_API_KEY>" | python3 -m json.tool | head -30
+# 绕过入口直连 CPA，用于区分「入口问题」和「CPA 问题」
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:18317/v1/models
 ```
 
 模型列表只含 `devin/swe-2`、`devin/swe-2-lightning`、`devin/gemini-4-argon`、`deepseek-v4.1-flash` 四个模型即成功。
 
 ## 第四步：面板访问
+
+> 8317 现在是 **nginx 入口**：管理口仍按设计对公网开放，但只在管理面上限速
+> （`/v0/management/*` 与 `/management*` 共用 10 r/min + burst 5，见 README 3.10）；
+> **模型调用 `/v1/*` 不限速、不限并发**。排障时可走 `127.0.0.1:18317` 绕开入口。只想给客户端用、不想暴露管理口时，
+> 在入口上加 `location /v0/ { deny all; }` 或回退到无 override 的形态。
+
 
 - **CPAMC 管理面板**：`http://<服务器IP>:8317/management.html`，密码 = `CPA_ADMIN_SECRET`
 - **Go 多账号余量**：CPAMC 配额管理页的 `opencode-go-pool.json` 凭据卡片（综合三行 + 逐 key 分组）
@@ -102,5 +112,7 @@ curl -s http://127.0.0.1:8317/v1/models \
 
 ## 防火墙提醒
 
-- 8317 公网已放行（实测 200）。如果只要管理面板用、不想暴露管理 API，把 `management.allow-remote` 改 `false` 后用 SSH 转发访问。
-- 18081 已绑定 `127.0.0.1`，外部访问必须走 SSH 隧道。
+- **8317 是唯一该放行的端口**，现在是 nginx 入口（仅管理面限速 + 429 JSON，`/v1` 纯透传）。
+- `18317` 是 CPA 的宿主机回环端口（`127.0.0.1`），只用于排障，绝不要对公网开放。
+- `18081` 已绑定 `127.0.0.1`，外部访问必须走 SSH 隧道；`8080` 未发布到宿主机。
+- 回滚到「CPA 直接对外」：`mv docker-compose.override.yml{,.disabled} && docker compose up -d`。
