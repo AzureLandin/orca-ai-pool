@@ -63,6 +63,7 @@ orca-ai-pool/
 ├── cliproxy/
 │   ├── config.yaml                       # ← render 产物（gitignore）
 │   ├── auths/                            # ← render 产物：<id>.json 凭据（gitignore *.json）
+│   ├── plugins/linux/amd64/              # ← make install 产物：opencode-go-quota.so（gitignore）
 │   └── logs/                             # 运行日志（gitignore）
 ├── opencode2api/
 │   └── config.json                       # ← render 产物（gitignore，作为 state 卷种子）
@@ -179,17 +180,17 @@ curl -s http://$HOST:8317/v1/models -H "Authorization: Bearer $CPA_KEY" | python
 # 冒烟：免费模型（Devin）
 curl -s http://$HOST:8317/v1/chat/completions \
   -H "Authorization: Bearer $CPA_KEY" -H 'Content-Type: application/json' \
-  -d '{"model":"brain-swe2","messages":[{"role":"user","content":"ping"}],"max_tokens":8}'
+  -d '{"model":"devin/swe-2","messages":[{"role":"user","content":"ping"}],"max_tokens":8}'
 
 # 冒烟：付费模型（OpenCode Go 链路）
 curl -s http://$HOST:8317/v1/chat/completions \
   -H "Authorization: Bearer $CPA_KEY" -H 'Content-Type: application/json' \
-  -d '{"model":"worker-ds41","messages":[{"role":"user","content":"ping"}],"max_tokens":8}'
+  -d '{"model":"deepseek-v4.1-flash","messages":[{"role":"user","content":"ping"}],"max_tokens":8}'
 
-# 冒烟：GOAT 直连
+# 冒烟：GOAT 直连（同 alias，CPA 轮询到 GOAT 上游时即为直连）
 curl -s http://$HOST:8317/v1/chat/completions \
   -H "Authorization: Bearer $CPA_KEY" -H 'Content-Type: application/json' \
-  -d '{"model":"brain-kimi-k3-fallback","messages":[{"role":"user","content":"ping"}],"max_tokens":8}'
+  -d '{"model":"deepseek-v4.1-flash","messages":[{"role":"user","content":"ping"}],"max_tokens":8}'
 ```
 
 三条都返回 `choices` 即部署完成。
@@ -261,23 +262,19 @@ command_code_goat_pool:
 
 ## 5. 模型路由表
 
-客户端只认 alias，不认上游模型 ID。
+对外只保留 4 个模型，客户端直接用真实 ID（不做别名映射，`GET /v1/models` 即路由表）：
 
-| 客户端模型名 (alias) | 上游 | 上游模型 ID | 典型用途 |
-|---|---|---|---|
-| `brain-swe2` | Devin OAuth | `swe-2` | 免费主力，通用编码/推理，量大管饱 |
+| 客户端模型名 | 上游 | 典型用途 |
+|---|---|---|
+| `devin/swe-2` | Devin OAuth | 免费主力，通用编码/推理，量大管饱 |
+| `devin/swe-2-lightning` | Devin OAuth | 低延迟版本，交互式补全、小任务 |
+| `devin/gemini-4-argon` | Devin OAuth | 长上下文分析、架构评审 |
+| `deepseek-v4.1-flash` | OpenCode Go / GOAT | 批量代码生成、脏活累活，性价比最高 |
 
-> 注意：`oauth.model-alias` 的别名（`brain-swe2`/`brain-swe2-fast`）只在**请求执行时**解析，
-> 不会出现在 `GET /v1/models` 列表中——但直接请求该别名仍会命中上游，这是 CPA 的正常行为。
-> 反之 `brain-argon`/`worker-ds41`/`brain-kimi-k3-fallback` 出现在模型列表，
-> 因为它们由 openai-compatibility 组的 models 注册。
-> 另注：Devin 付费快速档真实上游 ID 是 `swe-2-lightning`（非 `swe-2-fast`，后者不存在）。
-| `brain-swe2-fast` | Devin OAuth | `swe-2-lightning` | 低延迟版本，交互式补全、小任务 |
-| `brain-argon` | Devin OAuth / OpenCode Go | `gemini-4-argon` | 长上下文分析、架构评审（两个上游共用 alias，按可用性路由） |
-| `worker-ds41` | OpenCode Go / GOAT | `deepseek-v4.1-flash`（Go）/ `deepseek/deepseek-v4.1-flash`（GOAT） | 批量代码生成、脏活累活，性价比最高 |
-| `brain-kimi-k3-fallback` | OpenCode Go / GOAT | `kimi-k3` | 长文写作、中文理解；免费池限流时的兜底 |
-
-> 同名 alias 出现在多个 provider 时，CPA 按 `weighted-round-robin` 在可用 provider 间分流，
+> Devin 凭据的上游目录有几十个模型，`oauth.excluded-models` 按家族前缀收敛到这三个
+> （只支持通配符排除不支持白名单；新家族上线会漏进列表，需往 `DEVIN_EXCLUDED_MODELS` 补前缀）。
+> GOAT 上游模型 ID 为 `deepseek/deepseek-v4.1-flash`，对外统一暴露 `deepseek-v4.1-flash`。
+> 同名模型出现在多个 provider 时，CPA 按 `weighted-round-robin` 在可用 provider 间分流，
 > 429/500 命中 `request-scoped-errors` 的匹配串会「继续 + 冷却」而非直接失败。
 
 ---
@@ -290,11 +287,10 @@ command_code_goat_pool:
 
 | 项目 | 额度 |
 |---|---|
-| DeepSeek V4.1 Flash (`worker-ds41`) | **$80 / 月** |
+| DeepSeek V4.1 Flash | **$80 / 月** |
 | └ 5 小时滚动窗口 | $16 |
 | └ 周窗口 | $40 |
-| Gemini 4 Argon (`brain-argon`) | $30 / 月 |
-| Kimi K3 (`brain-kimi-k3-fallback`) | $15 / 月 |
+| Gemini 4 Argon (`devin/gemini-4-argon`) | $30 / 月 |
 
 **Command Code GOAT**
 
@@ -315,7 +311,9 @@ python3 scripts/poolctl.py quota
 ```
 
 Devin 侧走 `POST /v0/management/auth-files/refresh` → `GET /v0/management/auth-files`
-读 `quota.signals`；Go / GOAT 侧打印基于窗口用量的容量估算。
+读 `quota.signals`；OpenCode Go 侧走自研 `opencode-go-quota` 插件的
+`/v0/management/plugins/opencode-go-quota/quota`（逐 key rolling(5h)/weekly/monthly
+真实用量百分比，见第 10.5 节）；GOAT 侧仍为容量估算。
 
 ---
 
@@ -463,9 +461,43 @@ curl -s http://<server>:8317/v0/management/auth-files \
 
 ---
 
+## 10.5 OpenCode Go 多账号余量监控（自研 `opencode-go-quota` 插件）
+
+仓库自带一个 CPA C ABI 插件（`plugin/opencode-go-quota/`，Go），实现 CPA 的
+**`AuthProvider` + `QuotaProvider`** 双能力：
+
+- `auth.parse` 把 render 生成的 `auths/opencode-go-pool.json`（`type: "opencode-go"`）
+  注册成 CPAMC **配额管理页的一等凭据**——和 Devin 凭据并列的原生卡片。
+- `quota.fetch` 并发拉取 `GET https://opencode.ai/zen/go/v1/usage`（每 key rolling(5h)/weekly/monthly
+  三窗口），聚合后返回 `subscription + summary + groups`：卡片顶部是三窗口平均余量
+  （「所有 key 综合」行），失败 key 单列错误行。
+- 数据走原生 `/v0/management/plugins/opencode-go-quota/quota` 管理端点，
+  `poolctl quota` 的第二张表也读它。
+
+启用链路：
+
+```bash
+cd plugin/opencode-go-quota && make install   # CGO_ENABLED=1 -buildmode=c-shared
+python3 scripts/poolctl.py render             # 写凭据文件 + plugins.configs
+docker compose restart cliproxyapi            # 插件只在 CPA 启动时加载
+```
+
+产物落到 `cliproxy/plugins/linux/amd64/opencode-go-quota.so`（gitignore），
+`render` 自动把 `opencode_go_pool.keys` 写进 `plugins.configs.opencode-go-quota`。
+加/减 key 后 render + restart 即自适应；`monitoring.enabled: false` 可关闭插件配置生成。
+
+注意事项：
+
+- 插件的用量请求从 CPA 容器出口发出，**不经过** accounts.yaml 里给推理配的代理——
+  `/usage` 是只读接口，通常无风控问题；如果某 key 的 `check-opencode` 正常而插件查询
+  失败，先怀疑出口 IP 差异。
+- `.so` 未安装但 `plugins.enabled: true` 时 CPA 只会在日志里报插件加载失败，不影响主网关。
+
+---
+
 ## 11. poolctl 用法
 
-`scripts/poolctl.py` 是唯一编排入口，五个子命令：
+`scripts/poolctl.py` 是唯一编排入口，六个子命令：
 
 ### `render`
 
@@ -519,7 +551,19 @@ python3 scripts/poolctl.py quota
 
 Devin：`POST /v0/management/auth-files/refresh` 触发刷新，再 `GET /v0/management/auth-files`
 读 `quota.signals`，打成配额表。
-Go / GOAT：按窗口用量打印容量估算表。
+OpenCode Go：调自研 `opencode-go-quota` 插件的 quota.fetch 端点取逐 key
+真实用量（rolling/weekly/monthly 剩余百分比 + 重置倒计时）。
+GOAT：按窗口用量打印容量估算表。
+
+### 插件构建
+
+```bash
+cd plugin/opencode-go-quota && make install
+```
+
+`CGO_ENABLED=1 go build -buildmode=c-shared` 编译 `opencode-go-quota.so`，
+安装到 `cliproxy/plugins/linux/amd64/`（compose 已挂载 `/CLIProxyAPI/plugins`）。
+装完 `render` + `docker compose restart cliproxyapi` 生效。
 
 ### `switch-mode`
 
@@ -587,10 +631,10 @@ docker compose cp opencode2api/config.json opencode2api:/run/config/opencode2api
 想彻底重来：`docker compose down && docker volume rm orca-ai-pool_opencode2api-state && docker compose up -d`
 （会清空运行态，慎用）。
 
-**Q3：`worker-ds41` 稳定 403？**
+**Q3：`deepseek-v4.1-flash` 稳定 403？**
 Go 账号没开 Privacy Global。见 4.2，改完 `poolctl check-opencode` 复验。
 
-**Q4：`brain-swe2` 间歇 429，日志里有 `Reached free model rate limit`？**
+**Q4：`devin/swe-2` 间歇 429，日志里有 `Reached free model rate limit`？**
 Devin 免费池限流。`request-scoped-errors` 已配置成「换下一个凭据 + 当前号冷却」，正常现象。
 持续 429 说明 Pro 号数量不够，扩号或加 Max 走 `max-hybrid`。
 

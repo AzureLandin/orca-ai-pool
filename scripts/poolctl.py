@@ -14,6 +14,8 @@
 
 import argparse
 import datetime
+import hashlib
+import io
 import json
 import os
 import re
@@ -23,6 +25,7 @@ import sys
 import unicodedata
 import urllib.error
 import urllib.request
+import zipfile
 from pathlib import Path
 
 import yaml
@@ -71,20 +74,35 @@ REQUIRED_ENV_KEYS = [
     "OC2API_WEBUI_PASSWORD",
 ]
 
-# OpenAI 兼容上游组共用的模型映射（worker-ds41 跨池聚合）
-# 注：gemini-4-argon（brain-argon）不进 OpenCode Go 池——其上游为 Google 原生
+# OpenAI 兼容上游组共用的模型映射（DS4.1F 跨池聚合，对外直接用上游模型名）
+# 注：gemini-4-argon 不进 OpenCode Go 池——其上游为 Google 原生
 # 协议（/inference/go/google/v1beta），opencode2api 仅支持 chat/responses/anthropic
-# 三种协议转换，无法桥接。brain-argon 仅由 Devin oauth 别名提供。
+# 三种协议转换，无法桥接，仅由 Devin oauth 通道提供（devin/gemini-4-argon）。
 OC2API_GO_MODELS = [
-    {"name": "deepseek-v4.1-flash", "alias": "worker-ds41"},
-    {"name": "kimi-k3", "alias": "brain-kimi-k3-fallback"},
+    {"name": "deepseek-v4.1-flash", "alias": "deepseek-v4.1-flash"},
 ]
 
 GOAT_MODELS = [
-    {"name": "deepseek/deepseek-v4.1-flash", "alias": "worker-ds41"},
-    {"name": "kimi-k3", "alias": "brain-kimi-k3-fallback"},
+    {"name": "deepseek/deepseek-v4.1-flash", "alias": "deepseek-v4.1-flash"},
 ]
 
+# Devin 凭据的模型目录有几十个上游模型，但号池只开放
+# swe-2 / swe-2-lightning / gemini-4-argon 三个（客户端按 devin/* 真实 ID 调用）。
+# oauth.excluded-models 只支持通配符排除、不支持白名单；匹配对象是含
+# "devin/" 前缀的完整模型 ID（实测 devin/* 会全排），这里按家族前缀收敛；
+# 新家族模型上线时会漏进模型列表，届时往这个清单补一条前缀即可。
+DEVIN_EXCLUDED_MODELS = [
+    "devin/claude-*",
+    "devin/deepseek-*",
+    "devin/gemini-3-*",
+    "devin/glm-*",
+    "devin/gpt-*",
+    "devin/grok-*",
+    "devin/kimi-*",
+    "devin/muse-*",
+    "devin/nemotron-*",
+    "devin/swe-1-*",
+]
 
 class PoolctlError(Exception):
     """可预期的用户侧错误（打印后以非零码退出，不打印堆栈）。"""
@@ -443,12 +461,19 @@ def _sensitive_words(pool):
     return words
 
 
-def _build_cliproxy_config(env, mode, words, goat_keys):
+def _env_flag(env, key):
+    return str(env.get(key) or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _build_cliproxy_config(env, mode, words, goat_keys, go_keys, monitor):
+    # DISABLE_AUTH=true（.env，测试环境用）：access.api-keys 留空 = 客户端免鉴权。
+    # 管理接口仍走 CPA_ADMIN_SECRET（secret-key 置空会把 /v0/management 整个关掉）。
+    access_keys = [] if _env_flag(env, "DISABLE_AUTH") else [env["MASTER_API_KEY"]]
     config = {
         "config-version": 8,
         "server": {"host": "", "port": int(env.get("GATEWAY_PORT") or DEFAULT_GATEWAY_PORT)},
         "management": {"allow-remote": True, "secret-key": env["CPA_ADMIN_SECRET"]},
-        "access": {"api-keys": [env["MASTER_API_KEY"]]},
+        "access": {"api-keys": access_keys},
         "routing": {
             "strategy": "weighted-round-robin",
             "session-affinity": True,
@@ -469,13 +494,7 @@ def _build_cliproxy_config(env, mode, words, goat_keys):
         "observability": {"usage": {"usage-statistics-enabled": True}},
         "oauth": {
             "auth-dir": "/root/.cli-proxy-api",
-            "model-alias": {
-                "devin": [
-                    {"name": "swe-2", "alias": "brain-swe2"},
-                    {"name": "swe-2-lightning", "alias": "brain-swe2-fast"},
-                    {"name": "gemini-4-argon", "alias": "brain-argon"},
-                ]
-            },
+            "excluded-models": {"devin": list(DEVIN_EXCLUDED_MODELS)},
             "request-scoped-errors": {
                 "devin": [
                     {
@@ -515,6 +534,25 @@ def _build_cliproxy_config(env, mode, words, goat_keys):
                 "keys": [{"api-key": item["api_key"], "weight": item["weight"]} for item in goat_keys],
             }
         )
+
+    if monitor.get("enabled", True):
+        plugin_config = {}
+        # 自研 QuotaProvider+AuthProvider 插件：每个 Go key 成为 CPAMC
+        # 配额管理页的一等凭据（render 生成的 opencode-go-*.json），
+        # quota.fetch 按凭据单 key 查询，原生卡片渲染。
+        config["plugins"] = {
+            "enabled": True,
+            "dir": "plugins",
+            "configs": {
+                "opencode-go-quota": {
+                    "enabled": True,
+                    "priority": 1,
+                    "opencode_api_base": "https://opencode.ai/zen/go/v1",
+                    "opencode_api_keys": list(go_keys),
+                    "refresh_seconds": 60,
+                },
+            },
+        }
     return config
 
 
@@ -766,7 +804,10 @@ def render(root):
             "weight": weight,
         }
         if mode == "max-hybrid" and plan_lower == "pro":
-            credential["excluded_models"] = list(PRO_EXCLUDED_MODELS)
+            # 凭据级 excluded_models 会整表覆盖 oauth.excluded-models（不合并），
+            # 所以 Pro 号要把家族前缀排除也一并带上——否则 max-hybrid 下 Pro
+            # 反而会暴露全部 Devin 模型。
+            credential["excluded_models"] = list(PRO_EXCLUDED_MODELS) + list(DEVIN_EXCLUDED_MODELS)
         filename = "%s.json" % account["id"]
         expected_names.add(filename)
         atomic_write_json(auths_dir / filename, credential)
@@ -777,6 +818,22 @@ def render(root):
                 weight,
                 ", 已排除付费模型" if "excluded_models" in credential else "",
             ))
+
+    # opencode-go-quota 插件 AuthProvider 凭据：池综合卡一张，
+    # quota.fetch 聚合所有 key（顶部综合三行 + 逐 key 分组）。
+    expected_g = set()
+    if go_keys:
+        pname = "opencode-go-pool.json"
+        atomic_write_json(
+            auths_dir / pname,
+            {"type": "opencode-go", "api_key": "__pool__", "name": "OpenCode Go Pool"},
+        )
+        expected_g.add(pname)
+        _ok(f"凭据 {pname} (opencode-go 综合配额)")
+    for stale in sorted(auths_dir.glob("opencode-go-*.json")):
+        if stale.name not in expected_g:
+            stale.unlink()
+            _warn(f"已删除过期凭据: {stale.relative_to(root)}")
 
     for stale in sorted(auths_dir.glob("devin-*.json")):
         if stale.name in expected_names:
@@ -790,9 +847,14 @@ def render(root):
     if not accounts:
         _warn("devin_pool.accounts 为空，未生成任何 Devin 凭据")
 
+    monitor = config.get("monitoring") or {}
+    if not isinstance(monitor, dict):
+        raise PoolctlError("accounts.yaml 的 monitoring 必须是映射(dict)")
+    monitor.setdefault("enabled", True)
+
     # --- 2. cliproxy/config.yaml ------------------------------------------
     words = _sensitive_words(devin_pool)
-    cliproxy_config = _build_cliproxy_config(env, mode, words, goat_keys)
+    cliproxy_config = _build_cliproxy_config(env, mode, words, goat_keys, go_keys, monitor)
     cliproxy_path = root / "cliproxy" / "config.yaml"
     cliproxy_text = YAML_HEADER + yaml.safe_dump(
         cliproxy_config,
@@ -1050,7 +1112,7 @@ def quota(root):
                 "POST",
                 "http://%s:%s/v0/management/auth-files/refresh" % (host, port),
                 headers={"Authorization": "Bearer %s" % secret},
-                payload={"auth_index": auth_index},
+                payload={"auth_index": auth_index, "name": item.get("name") or auth_index},
                 timeout=45,
             )
             if refresh_status != 200:
@@ -1104,6 +1166,76 @@ def quota(root):
         goat_pool = {}
     goat_count = len(_as_list(goat_pool.get("keys"), "command_code_goat_pool.keys"))
 
+    # OpenCode Go 实时余量（自研 opencode-go-quota 插件，逐凭据 quota.fetch）
+    _, files_payload = _management_get(host, port, secret)
+    usage_rows = []
+    go_auths = [
+        item for item in _as_list((files_payload or {}).get("files"), "files")
+        if isinstance(item, dict) and item.get("provider") == "opencode-go"
+    ]
+    for entry in go_auths:
+        fname = entry.get("name") or "-"
+        auth_index = entry.get("auth_index")
+        if not auth_index:
+            continue
+        q_status, q_payload = _http_json(
+            "POST",
+            "http://%s:%s/v0/management/plugins/opencode-go-quota/quota" % (host, port),
+            headers={"Authorization": "Bearer %s" % secret},
+            payload={"auth_index": auth_index, "provider": "opencode-go", "auth_id": fname},
+            timeout=60,
+        )
+
+        def _bucket(buckets, *wnames):
+            for b in _as_list(buckets, ",".join(wnames)):
+                if isinstance(b, dict) and b.get("window") in wnames:
+                    frac = b.get("remainingFraction")
+                    try:
+                        pct_text = "%.1f%%" % (float(frac) * 100)
+                    except (TypeError, ValueError):
+                        return "-", "-"
+                    reset_at = b.get("resetTime")
+                    secs = None
+                    if reset_at:
+                        try:
+                            dt = datetime.datetime.fromisoformat(str(reset_at).replace("Z", "+00:00"))
+                            secs = max(0, int((dt - datetime.datetime.now(dt.tzinfo)).total_seconds()))
+                        except ValueError:
+                            pass
+                    return pct_text, _fmt_reset(secs)
+            return "-", "-"
+
+        if q_status == 200 and isinstance(q_payload, dict):
+            groups = _as_list(q_payload.get("groups"), "groups")
+            buckets = (groups[0] or {}).get("buckets") if groups else []
+            roll_pct, roll_reset = _bucket(buckets, "5h", "rolling")
+            week_pct, week_reset = _bucket(buckets, "weekly")
+            month_pct, month_reset = _bucket(buckets, "monthly")
+            state = "ok"
+        else:
+            roll_pct = roll_reset = week_pct = week_reset = month_pct = month_reset = "-"
+            state = "fail:%s" % _short(q_payload if q_status else "unreachable", 60)
+        usage_rows.append(
+            [fname, state, roll_pct, roll_reset, week_pct, week_reset, month_pct, month_reset]
+        )
+    if not go_auths:
+        _warn("未发现 opencode-go 凭据（先运行 poolctl render 并重启 CPA）")
+
+    print_table(
+        "OpenCode Go 实时余量（opencode-go-quota 插件，剩余百分比 + 窗口重置倒计时）",
+        [
+            "key_id",
+            "state",
+            "rolling_5h_remaining",
+            "rolling_reset",
+            "weekly_remaining",
+            "weekly_reset",
+            "monthly_remaining",
+            "monthly_reset",
+        ],
+        usage_rows,
+    )
+
     print_table(
         "执行池额度估算（按单号公开额度线性累加，非实时查询）",
         ["池", "key 数", "单号月额度", "单号 5h", "单号周", "池月总计", "池 5h 总计", "池周总计"],
@@ -1134,6 +1266,9 @@ def quota(root):
     _emit("")
     _info(
         "完整可视化面板请用浏览器打开 http://%s:%s （CPAMC，使用 CPA_ADMIN_SECRET 登录）" % (host, port)
+    )
+    _info(
+        "多账号余量: CPAMC 配额管理页 opencode-go-* 凭据卡片"
     )
     return 0
 
@@ -1225,11 +1360,10 @@ def export_client(root):
         "模型路由建议",
         ["别名", "上游", "用途"],
         [
-            ["brain-swe2", "devin/swe-2 (Fast Off)", "免费主脑，日常编码首选"],
-            ["brain-argon", "devin/gemini-4-argon", "逆向工程主力（C/C++ 重构与文档）"],
-            ["brain-swe2-fast", "devin/swe-2-lightning (Fast On)", "付费加速，仅在赶工时使用"],
-            ["worker-ds41", "OpenCode Go + GOAT 聚合", "执行池，批量改代码/跑测试"],
-            ["brain-kimi-k3-fallback", "OpenCode Go + GOAT", "兜底通道，DS4.1F 限流时切换"],
+            ["devin/swe-2", "Devin OAuth (Fast Off)", "免费主脑，日常编码首选"],
+            ["devin/gemini-4-argon", "Devin OAuth", "逆向工程主力（C/C++ 重构与文档）"],
+            ["devin/swe-2-lightning", "Devin OAuth (Fast On)", "付费加速，仅在赶工时使用"],
+            ["deepseek-v4.1-flash", "OpenCode Go + GOAT 聚合", "执行池，批量改代码/跑测试"],
         ],
     )
 
@@ -1246,6 +1380,9 @@ def export_client(root):
     _emit(json.dumps(devin_config, ensure_ascii=False, indent=2))
     _emit("JSON")
     return 0
+
+
+# ---------------------------------------------------------------------------
 
 
 # ---------------------------------------------------------------------------

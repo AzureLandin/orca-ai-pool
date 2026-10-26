@@ -68,20 +68,24 @@ python3 scripts/poolctl.py render
 # 2. 预检 Go 号（每个 key 发一次真实请求，403/429 会明确提示）
 python3 scripts/poolctl.py check-opencode
 
-# 3. 起栈
+# 3. 构建余量监控插件（opencode-go-quota.so → cliproxy/plugins/linux/amd64/）
+cd plugin/opencode-go-quota && make install && cd ../..
+
+# 4. 起栈
 docker compose up -d
 
-# 4. 验证（30 秒后）
+# 5. 验证（30 秒后）
 docker compose ps
 curl -s http://127.0.0.1:8317/v1/models \
   -H "Authorization: Bearer <MASTER_API_KEY>" | python3 -m json.tool | head -30
 ```
 
-看到 50 个模型且含 `worker-ds41`/`brain-argon`/`brain-kimi-k3-fallback` 三个聚合别名即成功。
+模型列表只含 `devin/swe-2`、`devin/swe-2-lightning`、`devin/gemini-4-argon`、`deepseek-v4.1-flash` 四个模型即成功。
 
 ## 第四步：面板访问
 
 - **CPAMC 管理面板**：`http://<服务器IP>:8317/management.html`，密码 = `CPA_ADMIN_SECRET`
+- **Go 多账号余量**：CPAMC 配额管理页的 `opencode-go-pool.json` 凭据卡片（综合三行 + 逐 key 分组）
 - **opencode2api WebUI**：`http://127.0.0.1:18081`（只绑回环，需 SSH 转发：`ssh -L 18081:127.0.0.1:18081 root@43.160.254.193`），账号 `admin` / `OC2API_WEBUI_PASSWORD`
 
 ## 常用运维命令
