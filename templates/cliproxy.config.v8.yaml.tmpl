@@ -131,18 +131,16 @@ api-keys:
       keys: []
 
 # opencode-go-quota 余量监控插件（自研 C ABI .so，plugin/opencode-go-quota/）
-# .so 安装至 <plugins.dir>/linux/amd64/commandcode.so（即 ./cliproxy/plugins/linux/amd64/，
+# .so 安装至 <plugins.dir>/linux/amd64/opencode-go-quota.so（即 ./cliproxy/plugins/linux/amd64/，
 # compose 挂载到 /CLIProxyAPI/plugins）；opencode_api_keys 由 render 从
-# accounts.yaml 的 opencode_go_pool.keys 填充。
+# accounts.yaml 的 opencode_go_pool.keys 填充；整段受 accounts.yaml monitoring.enabled 控制。
 plugins:
   enabled: true
   dir: "plugins"
   configs:
-    commandcode:
+    opencode-go-quota:
       enabled: true
       priority: 1
       opencode_api_base: "https://opencode.ai/zen/go/v1"
       opencode_api_keys: []     # render 填充 opencode_go_pool.keys
-      # 可选（accounts.yaml monitoring.* 控制）：
-      # commandcode_api_key: "user_..."   # 启用 Command Code 额度页
-      # session_token: "..."              # CC session cookie 回退
+      refresh_seconds: 60

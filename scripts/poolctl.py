@@ -14,8 +14,6 @@
 
 import argparse
 import datetime
-import hashlib
-import io
 import json
 import os
 import re
@@ -25,7 +23,6 @@ import sys
 import unicodedata
 import urllib.error
 import urllib.request
-import zipfile
 from pathlib import Path
 
 import yaml

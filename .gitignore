@@ -19,5 +19,4 @@ __pycache__/
 # 系统
 .DS_Store
 plugin/*/opencode-go-quota.so
-plugin/*/go.sum
 plugin/*/opencode-go-quota.h
