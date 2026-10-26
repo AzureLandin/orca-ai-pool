@@ -99,8 +99,8 @@ api-keys:
           alias: "worker-ds41"
         - name: "kimi-k3"
           alias: "brain-kimi-k3-fallback"
-        - name: "gemini-4-argon"
-          alias: "brain-argon"
+        # 注：gemini-4-argon 不进此池——上游为 Google 原生协议，opencode2api 无法桥接；
+        # brain-argon 仅由 Devin oauth 别名提供
       # render 填充：{api-key: "{{OC2API_SERVER_KEY}}", weight: 1} 一条即可（内网网关单 key）
       keys: []
     - name: "command-code-goat"

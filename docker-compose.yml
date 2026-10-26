@@ -56,8 +56,8 @@ services:
       opencode2api:
         condition: service_started
     healthcheck:
-      # 镜像内 wget/curl 哪个可用不确定，两个都试一遍
-      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8317/v1/models || curl -sf http://127.0.0.1:8317/v1/models"]
+      # 镜像内无 wget/curl，但有 bash——用 /dev/tcp 探测 8317（仅 TCP 层连通性）
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/8317'"]
       interval: 30s
       timeout: 10s
       retries: 3

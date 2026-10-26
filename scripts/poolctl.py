@@ -72,10 +72,12 @@ REQUIRED_ENV_KEYS = [
 ]
 
 # OpenAI 兼容上游组共用的模型映射（worker-ds41 跨池聚合）
+# 注：gemini-4-argon（brain-argon）不进 OpenCode Go 池——其上游为 Google 原生
+# 协议（/inference/go/google/v1beta），opencode2api 仅支持 chat/responses/anthropic
+# 三种协议转换，无法桥接。brain-argon 仅由 Devin oauth 别名提供。
 OC2API_GO_MODELS = [
     {"name": "deepseek-v4.1-flash", "alias": "worker-ds41"},
     {"name": "kimi-k3", "alias": "brain-kimi-k3-fallback"},
-    {"name": "gemini-4-argon", "alias": "brain-argon"},
 ]
 
 GOAT_MODELS = [
