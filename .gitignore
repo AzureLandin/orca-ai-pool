@@ -6,6 +6,7 @@ accounts.yaml
 cliproxy/auths/*.json
 cliproxy/config.yaml
 cliproxy/logs/
+cliproxy/plugins/
 opencode2api/config.json
 
 # 客户端导出
@@ -17,3 +18,6 @@ __pycache__/
 
 # 系统
 .DS_Store
+plugin/*/opencode-go-quota.so
+plugin/*/go.sum
+plugin/*/opencode-go-quota.h

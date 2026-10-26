@@ -15,9 +15,9 @@
 #   {{CPA_ADMIN_SECRET}}     management.secret-key / CPAMC 面板登录密码（.env: CPA_ADMIN_SECRET）
 #   {{OC2API_SERVER_KEY}}    CPA -> opencode2api 的内网 server_key（.env: OC2API_SERVER_KEY）
 #
-# 关于 oauth.model-alias：
-#   name  是【上游 Devin 模型 ID】，不含 "devin/" 前缀 —— 前缀由 provider 层自动注入，
-#         alias 才是客户端看到的模型名。
+# 关于 oauth.excluded-models：
+#   匹配含 "devin/" 前缀的完整模型 ID，只支持通配符排除、不支持白名单。
+#   当前按家族前缀收敛，只留 devin/swe-2、devin/swe-2-lightning、devin/gemini-4-argon。
 #
 # 关于 oauth.providers.devin.sensitive-words：
 #   默认空列表 [] = 关闭零宽混淆。由 accounts.yaml 的 devin_pool.sensitive_words 控制：
@@ -66,16 +66,29 @@ observability:
 
 oauth:
   auth-dir: "/root/.cli-proxy-api"
-  model-alias:
+  # Devin 三模型的上下文上限（客户端目录元数据；真实能力以上游模型卡为准）
+  settings:
     devin:
-      - name: "swe-2"
-        alias: "brain-swe2"
-      # 注：Devin 付费快速档真实模型 ID 为 swe-2-lightning（CPA 上游目录核实，
-      # "swe-2-fast" 是不存在的臆造 ID，勿改回）
-      - name: "swe-2-lightning"
-        alias: "brain-swe2-fast"
-      - name: "gemini-4-argon"
-        alias: "brain-argon"
+      - name: "devin/swe-2"
+        max-context-length: 262144
+      - name: "devin/swe-2-lightning"
+        max-context-length: 262144
+      - name: "devin/gemini-4-argon"
+        max-context-length: 1048576
+  # 模型收敛：devin 家族前缀排除，仅保留 swe-2 / swe-2-lightning / gemini-4-argon
+  # （无 model-alias——客户端直接按 devin/* 真实 ID 调用）
+  excluded-models:
+    devin:
+      - "devin/claude-*"
+      - "devin/deepseek-*"
+      - "devin/gemini-3-*"
+      - "devin/glm-*"
+      - "devin/gpt-*"
+      - "devin/grok-*"
+      - "devin/kimi-*"
+      - "devin/muse-*"
+      - "devin/nemotron-*"
+      - "devin/swe-1-*"
   request-scoped-errors:
     devin:
       - status: 429
@@ -96,11 +109,13 @@ api-keys:
       support-prompt-cache-key: true
       models:
         - name: "deepseek-v4.1-flash"
-          alias: "worker-ds41"
-        - name: "kimi-k3"
-          alias: "brain-kimi-k3-fallback"
+          alias: "deepseek-v4.1-flash"
+          # DS4.1F：上游上下文可自定义（默认 1M，Agent 侧自行限制；最大输出 ~256K）
+          max-context-length: 1048576
+          thinking:
+            levels: ["none", "low", "high", "max"]
         # 注：gemini-4-argon 不进此池——上游为 Google 原生协议，opencode2api 无法桥接；
-        # brain-argon 仅由 Devin oauth 别名提供
+        # devin/gemini-4-argon 仅由 Devin oauth 通道提供
       # render 填充：{api-key: "{{OC2API_SERVER_KEY}}", weight: 1} 一条即可（内网网关单 key）
       keys: []
     - name: "command-code-goat"
@@ -108,8 +123,26 @@ api-keys:
       support-prompt-cache-key: true
       models:
         - name: "deepseek/deepseek-v4.1-flash"
-          alias: "worker-ds41"
-        - name: "kimi-k3"
-          alias: "brain-kimi-k3-fallback"
+          alias: "deepseek-v4.1-flash"
+          max-context-length: 1048576
+          thinking:
+            levels: ["none", "low", "high", "max"]
       # render 填充每个 GOAT key: {api-key, weight}
       keys: []
+
+# opencode-go-quota 余量监控插件（自研 C ABI .so，plugin/opencode-go-quota/）
+# .so 安装至 <plugins.dir>/linux/amd64/commandcode.so（即 ./cliproxy/plugins/linux/amd64/，
+# compose 挂载到 /CLIProxyAPI/plugins）；opencode_api_keys 由 render 从
+# accounts.yaml 的 opencode_go_pool.keys 填充。
+plugins:
+  enabled: true
+  dir: "plugins"
+  configs:
+    commandcode:
+      enabled: true
+      priority: 1
+      opencode_api_base: "https://opencode.ai/zen/go/v1"
+      opencode_api_keys: []     # render 填充 opencode_go_pool.keys
+      # 可选（accounts.yaml monitoring.* 控制）：
+      # commandcode_api_key: "user_..."   # 启用 Command Code 额度页
+      # session_token: "..."              # CC session cookie 回退

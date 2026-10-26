@@ -49,3 +49,9 @@ command_code_goat_pool:
     - name: "goat-2"
       api_key: "cc_goat_key_02_replace_me"
       weight: 1
+
+# opencode-go-quota 余量监控插件（自研 CPA C ABI 插件，plugin/opencode-go-quota/）
+# OpenCode Go 多账号余量自动取自上面的 opencode_go_pool.keys，无需在此重复填写。
+# 插件 .so 构建：cd plugin/opencode-go-quota && make install
+monitoring:
+  enabled: true                     # 关闭后 render 不再输出 plugins 段

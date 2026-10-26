@@ -52,6 +52,8 @@ services:
       - ./cliproxy/config.yaml:/CLIProxyAPI/config.yaml:ro
       - ./cliproxy/auths:/root/.cli-proxy-api
       - ./cliproxy/logs:/CLIProxyAPI/logs
+      # C ABI 插件目录（commandcode 余量监控插件 .so 由 poolctl install-plugin 安装）
+      - ./cliproxy/plugins:/CLIProxyAPI/plugins
     depends_on:
       opencode2api:
         condition: service_started
