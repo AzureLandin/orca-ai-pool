@@ -1,0 +1,38 @@
+# 公网入口 override —— 在基础 compose 之上叠加 nginx 反代（仅管理面限速）。
+#
+# docker compose 会自动加载本文件（docker-compose.override.yml），无需 -f 参数。
+#
+# 效果：
+#   * 8317 由 nginx 监听（公网）；/v1 模型调用不限速，只有 CPAMC 管理面按 IP 限速
+#   * CPA 自身端口在宿主机只绑 127.0.0.1:18317 —— 排障时可 curl 它对比，
+#     绕过入口直连 CPA，用来区分「入口管理面 429」与「上游限流 429」
+#
+# 想回到 CPA 直接对外的旧形态：
+#   mv docker-compose.override.yml{,.disabled} && docker compose up -d
+
+services:
+  cliproxyapi:
+    # 覆盖基础 compose 的 "8317:8317"：公网口交给 ingress
+    ports:
+      - "127.0.0.1:18317:8317"
+
+  ingress:
+    image: nginx:alpine
+    container_name: orca-ingress
+    restart: unless-stopped
+    ports:
+      - "8317:8317"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      cliproxyapi:
+        condition: service_started
+    healthcheck:
+      # 校验配置语法；流量健康由 cliproxyapi 自己的 healthcheck 覆盖
+      test: ["CMD-SHELL", "nginx -t"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s
+    networks:
+      - orca-net
