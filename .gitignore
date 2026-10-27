@@ -1,6 +1,8 @@
 # 密钥与真实号池清单
 .env
+.env.bak.*
 accounts.yaml
+accounts.yaml.bak
 
 # render 产物（example 文件不受影响：config.yaml.example / config.json.example）
 cliproxy/auths/*.json
@@ -8,9 +10,13 @@ cliproxy/config.yaml
 cliproxy/logs/
 cliproxy/plugins/
 opencode2api/config.json
+nginx/
 
 # 客户端导出
 export/
+
+# 破甲通道提示词（按 prompts/manifest.yaml 的固定 commit 下载，不随仓库分发）
+prompts/upstream/
 
 # Python
 __pycache__/
@@ -20,6 +26,8 @@ __pycache__/
 .DS_Store
 plugin/*/opencode-go-quota.so
 plugin/*/opencode-go-quota.h
+plugin/jailbreak-inject/jailbreak-inject.so
+plugin/jailbreak-inject/jailbreak-inject.h
 
 # poolctl 插件漂移检测的运行时状态
 .poolctl-plugin-state.json

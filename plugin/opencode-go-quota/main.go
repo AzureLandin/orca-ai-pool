@@ -167,11 +167,11 @@ func callHost(method string, payload []byte) ([]byte, bool) {
 // ---------------------------------------------------------------------------
 
 type pluginConfig struct {
-	mu               sync.RWMutex
-	OpenCodeAPIKey   string   `yaml:"opencode_api_key"`
-	OpenCodeAPIKeys  []string `yaml:"opencode_api_keys"`
-	OpenCodeAPIBase  string   `yaml:"opencode_api_base"`
-	RefreshSeconds   int      `yaml:"refresh_seconds"`
+	mu              sync.RWMutex
+	OpenCodeAPIKey  string   `yaml:"opencode_api_key"`
+	OpenCodeAPIKeys []string `yaml:"opencode_api_keys"`
+	OpenCodeAPIBase string   `yaml:"opencode_api_base"`
+	RefreshSeconds  int      `yaml:"refresh_seconds"`
 }
 
 var cfg = &pluginConfig{OpenCodeAPIBase: "https://opencode.ai/zen/go/v1"}
@@ -185,7 +185,6 @@ func (c *pluginConfig) update(raw []byte) {
 		return
 	}
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	keys := make([]string, 0, len(tmp.OpenCodeAPIKeys)+1)
 	seen := map[string]bool{}
 	for _, k := range append(tmp.OpenCodeAPIKeys, tmp.OpenCodeAPIKey) {
@@ -204,9 +203,11 @@ func (c *pluginConfig) update(raw []byte) {
 	if tmp.RefreshSeconds > 0 {
 		c.RefreshSeconds = tmp.RefreshSeconds
 	}
+	c.mu.Unlock()
+	invalidateQuotaCache()
 }
 
-func (c *pluginConfig) snapshot() (base string, keys []string) {
+func (c *pluginConfig) snapshot() (base string, keys []string, refresh time.Duration) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	base = c.OpenCodeAPIBase
@@ -214,6 +215,10 @@ func (c *pluginConfig) snapshot() (base string, keys []string) {
 		base = "https://opencode.ai/zen/go/v1"
 	}
 	keys = append([]string(nil), c.OpenCodeAPIKeys...)
+	refresh = 60 * time.Second
+	if c.RefreshSeconds > 0 {
+		refresh = time.Duration(c.RefreshSeconds) * time.Second
+	}
 	return
 }
 
@@ -269,10 +274,10 @@ func registration() map[string]any {
 			"Author":           "orca-ai-pool",
 			"GitHubRepository": "https://github.com/AzureLandin/orca-ai-pool",
 			"ConfigFields": []map[string]any{
-				{"Name": "opencode_api_keys", "Type": "string", "Description": "OpenCode Go API keys (YAML list) monitored by this quota provider"},
+				{"Name": "opencode_api_keys", "Type": "array", "Description": "OpenCode Go API keys monitored by this quota provider"},
 				{"Name": "opencode_api_key", "Type": "string", "Description": "Single OpenCode Go API key (fallback)"},
 				{"Name": "opencode_api_base", "Type": "string", "Description": "OpenCode Go API base URL (default https://opencode.ai/zen/go/v1)"},
-				{"Name": "refresh_seconds", "Type": "integer", "Description": "Minimum seconds between upstream usage polls per fetch (default 60)"},
+				{"Name": "refresh_seconds", "Type": "integer", "Description": "Minimum seconds between upstream usage polls per fetch (default 60; poolctl renders 300)"},
 			},
 		},
 		"capabilities": map[string]any{
@@ -365,8 +370,8 @@ func authParse(request []byte) []byte {
 		name = strings.TrimSuffix(req.FileName, ".json")
 	}
 	auth := map[string]any{
-		"id":       req.FileName,
-		"provider": "opencode-go",
+		"id":        req.FileName,
+		"provider":  "opencode-go",
 		"file_name": req.FileName,
 		"attributes": map[string]string{
 			"api_key": file.APIKey,
@@ -394,36 +399,46 @@ var cache struct {
 	keys    int
 }
 
+func invalidateQuotaCache() {
+	cache.mu.Lock()
+	cache.fetched = time.Time{}
+	cache.groups = nil
+	cache.summary = nil
+	cache.errs = 0
+	cache.keys = 0
+	cache.mu.Unlock()
+}
+
 func quotaFetch(request []byte) []byte {
 	var req struct {
-		AuthIndex  string `json:"auth_index"`
-		AuthID     string `json:"auth_id"`
-		Provider   string `json:"provider"`
+		AuthIndex  string            `json:"auth_index"`
+		AuthID     string            `json:"auth_id"`
+		Provider   string            `json:"provider"`
 		Attributes map[string]string `json:"attributes"`
 	}
 	_ = json.Unmarshal(request, &req)
 
 	// Per-credential fetch: pool auth (no N suffix) = aggregate all keys;
 	// opencode-go-N.json maps to the Nth configured key.
-	base, keys := cfg.snapshot()
+	base, keys, refresh := cfg.snapshot()
 	singleKey := false
 	authID := strings.TrimSpace(req.AuthID)
 	if m := goFileRe.FindStringSubmatch(authID); m != nil {
-		if n := atoi(m[1]); n >= 1 && n <= len(keys) {
-			keys = []string{keys[n-1]}
-			singleKey = true
+		n := atoi(m[1])
+		if n < 1 || n > len(keys) {
+			return errorEnvelope(
+				"unknown_auth",
+				fmt.Sprintf("auth file %s does not map to a configured key", authID),
+			)
 		}
+		keys = []string{keys[n-1]}
+		singleKey = true
 	} else if k := strings.TrimSpace(req.Attributes["api_key"]); k != "" && k != "__pool__" {
 		keys = []string{k}
 		singleKey = true
 	}
 	if len(keys) == 0 {
 		return errorEnvelope("no_keys", "opencode_api_keys is empty in plugin config")
-	}
-
-	refresh := time.Duration(60) * time.Second
-	if s := cfg.RefreshSeconds; s > 0 {
-		refresh = time.Duration(s) * time.Second
 	}
 
 	if !singleKey {
@@ -461,9 +476,9 @@ func quotaFetch(request []byte) []byte {
 	minRemaining := 101.0
 	// per-window aggregate across healthy keys (average remaining %, earliest reset)
 	agg := map[string]struct {
-		sum    float64
-		n      int
-		reset  string
+		sum   float64
+		n     int
+		reset string
 	}{"rolling": {}, "weekly": {}, "monthly": {}}
 	for _, r := range results {
 		if r.err != nil {
@@ -510,14 +525,12 @@ func quotaFetch(request []byte) []byte {
 			}
 			buckets = append(buckets, b)
 		}
-		if singleKey {
-			groups = append(groups, map[string]any{
-				"displayName": maskKey(r.key),
-				"buckets":     buckets,
-			})
-		}
+		groups = append(groups, map[string]any{
+			"displayName": maskKey(r.key),
+			"buckets":     buckets,
+		})
 	}
-	if errs < len(results) {
+	if !singleKey && errs < len(results) {
 		aggBuckets := make([]map[string]any, 0, 3)
 		for _, wname := range []struct{ name, label string }{
 			{"5h", "5h 滚动限额"}, {"weekly", "周限额"}, {"monthly", "月限额"},

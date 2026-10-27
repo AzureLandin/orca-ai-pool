@@ -55,3 +55,12 @@ command_code_goat_pool:
 # 插件 .so 构建：cd plugin/opencode-go-quota && make install
 monitoring:
   enabled: true                     # 关闭后 render 不再输出 plugins 段
+
+# 破甲通道：为每个有提示词的模型额外暴露一个 <模型名>-jailbreak 别名，
+# 请求该别名时仍路由回原模型/原上游，只是注入对应系统提示词；普通模型不变。
+# 启用前先：
+#   python3 scripts/poolctl.py sync-jailbreaks
+#   cd plugin/jailbreak-inject && make install
+# 然后 render + docker compose restart cliproxyapi（C ABI 插件只在启动时加载）。
+jailbreak_channel:
+  enabled: false

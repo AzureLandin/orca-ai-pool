@@ -1,0 +1,48 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        run: python3 -m pip install -r requirements.txt
+
+      - name: Run poolctl tests
+        run: python3 -m unittest discover -s tests -v
+
+      - name: Validate shell scripts
+        run: bash -n scripts/install-nginx.sh
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache-dependency-path: |
+            plugin/jailbreak-inject/go.sum
+            plugin/opencode-go-quota/go.sum
+
+      - name: Test jailbreak plugin
+        working-directory: plugin/jailbreak-inject
+        run: |
+          go vet ./...
+          go test -race ./...
+          CGO_ENABLED=1 go build -buildmode=c-shared -o /tmp/jailbreak-inject.so .
+
+      - name: Test quota plugin
+        working-directory: plugin/opencode-go-quota
+        run: |
+          go vet ./...
+          go test -race ./...
+          CGO_ENABLED=1 go build -buildmode=c-shared -o /tmp/opencode-go-quota.so .
+
+      - name: Validate Compose file
+        run: docker compose config --quiet

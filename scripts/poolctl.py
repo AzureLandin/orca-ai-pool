@@ -9,11 +9,13 @@
     ./scripts/poolctl.py --repo /path/to/repo render
 
 依赖: Python 3.8+ 标准库 + PyYAML（import yaml）。
-子命令: render | check-opencode | quota | switch-mode | rotate-secret | export-client
+子命令: render | check-opencode | quota | switch-mode | rotate-secret |
+        sync-jailbreaks | export-client
 """
 
 import argparse
 import datetime
+import fnmatch
 import hashlib
 import json
 import os
@@ -25,6 +27,7 @@ import sys
 import time
 import unicodedata
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -37,6 +40,8 @@ import yaml
 DEFAULT_GATEWAY_PORT = 8317
 # nginx 后面的 CPA 回环端口。公网 GATEWAY_PORT 由 nginx 占用，CPA 只听这个内部端口。
 DEFAULT_INTERNAL_PORT = 18317
+SENSITIVE_FILE_MODE = 0o600
+SENSITIVE_DIR_MODE = 0o700
 OC2API_WEBUI_URL = "http://127.0.0.1:18081"
 OC2API_CONTAINER_CONFIG_PATH = "/var/lib/opencode2api/config.json"
 OC2API_SERVICE = "opencode2api"
@@ -76,17 +81,38 @@ REQUIRED_ENV_KEYS = [
     "OC2API_WEBUI_PASSWORD",
 ]
 
+JAILBREAK_MANIFEST = "prompts/manifest.yaml"
+JAILBREAK_MODES = ("prepend", "append", "replace")
+
 # OpenAI 兼容上游组共用的模型映射（DS4.1F 跨池聚合，对外直接用上游模型名）
 # 注：gemini-4-argon 不进 OpenCode Go 池——其上游为 Google 原生
 # 协议（/inference/go/google/v1beta），opencode2api 仅支持 chat/responses/anthropic
 # 三种协议转换，无法桥接，仅由 Devin oauth 通道提供（devin/gemini-4-argon）。
 OC2API_GO_MODELS = [
-    {"name": "deepseek-v4.1-flash", "alias": "deepseek-v4.1-flash"},
+    {
+        "name": "deepseek-v4.1-flash",
+        "alias": "deepseek-v4.1-flash",
+        "max-context-length": 1048576,
+        "thinking": {"levels": ["none", "low", "high", "max"]},
+    },
 ]
 
 GOAT_MODELS = [
-    {"name": "deepseek/deepseek-v4.1-flash", "alias": "deepseek-v4.1-flash"},
+    {
+        "name": "deepseek/deepseek-v4.1-flash",
+        "alias": "deepseek-v4.1-flash",
+        "max-context-length": 1048576,
+        "thinking": {"levels": ["none", "low", "high", "max"]},
+    },
 ]
+
+# Devin OAuth 通道对外暴露的模型（与 oauth.settings.devin 保持一致）
+DEVIN_MODEL_SETTINGS = [
+    {"name": "devin/swe-2", "max-context-length": 262144},
+    {"name": "devin/swe-2-lightning", "max-context-length": 262144},
+    {"name": "devin/gemini-4-argon", "max-context-length": 1048576},
+]
+DEVIN_MODELS = [item["name"] for item in DEVIN_MODEL_SETTINGS]
 
 # Devin 凭据的模型目录有几十个上游模型，但号池只开放
 # swe-2 / swe-2-lightning / gemini-4-argon 三个（客户端按 devin/* 真实 ID 调用）。
@@ -215,14 +241,18 @@ def atomic_write_text(path, text, mode=None):
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
     with open(tmp, "w", encoding="utf-8", newline="\n") as handle:
+        if mode is not None:
+            os.fchmod(handle.fileno(), mode)
         handle.write(text)
-    if mode is not None:
-        os.chmod(tmp, mode)
     os.replace(tmp, path)
 
 
-def atomic_write_json(path, data):
-    atomic_write_text(path, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+def atomic_write_json(path, data, mode=None):
+    atomic_write_text(
+        path,
+        json.dumps(data, ensure_ascii=False, indent=2) + "\n",
+        mode=mode,
+    )
 
 
 def load_accounts(root):
@@ -311,14 +341,36 @@ def _require_env(env, keys, root):
         )
 
 
+def _warn_private_file_permissions(root):
+    for name in (".env", "accounts.yaml"):
+        path = Path(root) / name
+        try:
+            mode = path.stat().st_mode & 0o777
+        except OSError:
+            continue
+        if mode & 0o077:
+            _warn("%s 权限为 %04o，建议执行 chmod 600 %s" % (path, mode, name))
+
+
+def _int_env(env, key, default, minimum=1, maximum=65535):
+    raw = str(env.get(key) or default).strip()
+    if not raw.isdigit():
+        raise PoolctlError("%s 必须是整数，当前值: %r" % (key, raw))
+    value = int(raw)
+    if value < minimum or value > maximum:
+        raise PoolctlError(
+            "%s 必须在 %d..%d 之间，当前值: %d"
+            % (key, minimum, maximum, value)
+        )
+    return value
+
+
 def _gateway(env):
     host = str(env.get("GATEWAY_HOST") or "").strip()
     if not host:
         raise PoolctlError("缺少 GATEWAY_HOST，请检查 .env")
-    port = str(env.get("GATEWAY_PORT") or DEFAULT_GATEWAY_PORT).strip()
-    if not port.isdigit():
-        raise PoolctlError("GATEWAY_PORT 必须是整数，当前值: %r" % port)
-    return host, port
+    port = _int_env(env, "GATEWAY_PORT", DEFAULT_GATEWAY_PORT)
+    return host, str(port)
 
 
 def _env_secret(env, key, root):
@@ -424,6 +476,12 @@ def _devin_accounts(pool):
         if not token:
             raise PoolctlError("devin_pool.accounts[%s] 缺少 session_token" % account_id)
         plan = str(item.get("plan") or "Pro").strip()
+        if plan.lower() not in ("pro", "max"):
+            raise PoolctlError(
+                "devin_pool.accounts[%s].plan 只能是 Pro 或 Max，当前值: %r"
+                % (account_id, plan)
+            )
+        plan = "Max" if plan.lower() == "max" else "Pro"
         weight_raw = item.get("weight")
         if weight_raw is None or weight_raw == "":
             weight = None
@@ -479,7 +537,17 @@ WEAK_SECRET_VALUES = frozenset(
         "123456",
     }
 )
-# 密钥最短长度（字节）。CPA 会原样接收，弱密钥的唯一防线在这里。
+WEAK_SECRET_MARKERS = (
+    "change-me",
+    "change_me",
+    "changeme",
+    "replace-me",
+    "replace_me",
+    "your-",
+    "your_",
+    "placeholder",
+)
+# 密钥最短长度（字符）。CPA 会原样接收，弱密钥的唯一防线在这里。
 MIN_SECRET_LEN = 24
 
 
@@ -489,7 +557,11 @@ def _secret_problems(env):
     seen = {}
     # DISABLE_AUTH=true 时 MASTER_API_KEY 不参与鉴权，无需校验强度。
     keys = [] if _env_flag(env, "DISABLE_AUTH") else ["MASTER_API_KEY"]
-    keys += ["CPA_ADMIN_SECRET", "OC2API_WEBUI_PASSWORD"]
+    keys += [
+        "CPA_ADMIN_SECRET",
+        "OC2API_SERVER_KEY",
+        "OC2API_WEBUI_PASSWORD",
+    ]
     for key in keys:
         value = str(env.get(key) or "").strip()
         if not value:
@@ -497,6 +569,8 @@ def _secret_problems(env):
             continue
         if value.lower() in WEAK_SECRET_VALUES:
             problems.append((key, "是已知默认值"))
+        elif any(marker in value.lower() for marker in WEAK_SECRET_MARKERS):
+            problems.append((key, "仍是示例占位值"))
         elif len(value) < MIN_SECRET_LEN:
             problems.append((key, "长度 %d < %d" % (len(value), MIN_SECRET_LEN)))
         if value:
@@ -507,7 +581,277 @@ def _secret_problems(env):
     return problems
 
 
-def _build_cliproxy_config(env, mode, words, goat_keys, go_keys, monitor):
+def _load_jailbreak_raw(root):
+    path = Path(root) / JAILBREAK_MANIFEST
+    if not path.exists():
+        raise PoolctlError(
+            "未找到 %s\n破甲通道开启后需要提示词清单；请先执行: "
+            "python3 scripts/poolctl.py sync-jailbreaks" % path
+        )
+    try:
+        raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except yaml.YAMLError as exc:
+        raise PoolctlError("%s YAML 解析失败: %s" % (path, exc))
+    if not isinstance(raw, dict):
+        raise PoolctlError("%s 顶层必须是映射(dict)" % path)
+    return raw
+
+
+def _prompt_path(prompts_dir, file_rel, label):
+    file_rel = str(file_rel or "").strip()
+    if not file_rel:
+        raise PoolctlError("%s 缺少 file" % label)
+    rel = Path(file_rel)
+    if rel.is_absolute() or ".." in rel.parts:
+        raise PoolctlError("%s.file 必须是 prompts/ 下的相对路径，当前值: %r" % (label, file_rel))
+    path = (prompts_dir / rel).resolve()
+    try:
+        path.relative_to(prompts_dir.resolve())
+    except ValueError:
+        raise PoolctlError("%s.file 越出 prompts/ 目录: %r" % (label, file_rel))
+    return path
+
+
+def load_jailbreak_config(root, channel):
+    """把 accounts.yaml 的开关 + prompts/manifest.yaml 编译成插件配置。
+
+    关闭时返回 None；开启但提示词缺失时抛 PoolctlError，避免破甲模型
+    静默退化成普通模型。
+    """
+    if channel is None:
+        channel = {}
+    if not isinstance(channel, dict):
+        raise PoolctlError("accounts.yaml 的 jailbreak_channel 必须是映射(dict)")
+    if not channel.get("enabled"):
+        return None
+
+    raw = _load_jailbreak_raw(root)
+    suffix = str(raw.get("suffix") or "-jailbreak").strip()
+    unmapped = str(raw.get("unmapped") or "error").strip().lower()
+    default_mode = str(raw.get("default_mode") or "prepend").strip().lower()
+    if not suffix or any(char.isspace() for char in suffix):
+        raise PoolctlError("%s 的 suffix 不能为空且不能含空白，当前值: %r" % (JAILBREAK_MANIFEST, suffix))
+    if unmapped not in ("error", "pass"):
+        raise PoolctlError("%s 的 unmapped 只能是 error 或 pass" % JAILBREAK_MANIFEST)
+    if default_mode not in JAILBREAK_MODES:
+        raise PoolctlError(
+            "%s 的 default_mode 必须是 %s，当前值: %r"
+            % (JAILBREAK_MANIFEST, " / ".join(JAILBREAK_MODES), default_mode)
+        )
+
+    profiles_raw = raw.get("profiles")
+    if not isinstance(profiles_raw, list) or not profiles_raw:
+        raise PoolctlError("%s 的 profiles 必须是非空列表" % JAILBREAK_MANIFEST)
+
+    prompts_dir = Path(root) / "prompts"
+    compiled = []
+    seen_names = set()
+    for index, item in enumerate(profiles_raw, 1):
+        label = "profiles[%d]" % index
+        if not isinstance(item, dict):
+            raise PoolctlError("%s 必须是映射(dict)" % label)
+        name = str(item.get("name") or "profile-%d" % index).strip()
+        if not name:
+            raise PoolctlError("%s.name 不能为空" % label)
+        if name in seen_names:
+            raise PoolctlError("%s.name 重复: %s" % (label, name))
+        seen_names.add(name)
+
+        models_raw = item.get("models")
+        if isinstance(models_raw, str):
+            models_raw = [models_raw]
+        if not isinstance(models_raw, list):
+            raise PoolctlError("%s.models 必须是列表或字符串" % label)
+        models = [str(model).strip() for model in models_raw if str(model).strip()]
+        if not models:
+            raise PoolctlError("%s.models 不能为空" % label)
+
+        prompt_path = _prompt_path(prompts_dir, item.get("file"), label)
+        if not prompt_path.exists():
+            raise PoolctlError(
+                "破甲通道提示词缺失: %s\n先执行: python3 scripts/poolctl.py sync-jailbreaks"
+                % prompt_path
+            )
+        prompt = prompt_path.read_text(encoding="utf-8").strip()
+        if not prompt:
+            raise PoolctlError("破甲通道提示词为空: %s" % prompt_path)
+
+        overlay_rel = str(item.get("overlay") or "").strip()
+        if overlay_rel:
+            overlay_path = _prompt_path(prompts_dir, overlay_rel, label + ".overlay")
+            if not overlay_path.exists():
+                raise PoolctlError("破甲 prompt overlay 缺失: %s" % overlay_path)
+            overlay = overlay_path.read_text(encoding="utf-8").strip()
+            if not overlay:
+                raise PoolctlError("破甲 prompt overlay 为空: %s" % overlay_path)
+            overlay_position = str(item.get("overlay_position") or "prepend").strip().lower()
+            if overlay_position not in ("prepend", "append"):
+                raise PoolctlError(
+                    "%s.overlay_position 只能是 prepend 或 append，当前值: %r"
+                    % (label, overlay_position)
+                )
+            if overlay_position == "prepend":
+                prompt = overlay + "\n\n" + prompt
+            else:
+                prompt = prompt + "\n\n" + overlay
+
+        mode = str(item.get("mode") or default_mode).strip().lower()
+        if mode not in JAILBREAK_MODES:
+            raise PoolctlError(
+                "%s.mode 必须是 %s，当前值: %r"
+                % (label, " / ".join(JAILBREAK_MODES), mode)
+            )
+        compiled.append(
+            {
+                "name": name,
+                "models": models,
+                "mode": mode,
+                "prompt": prompt,
+            }
+        )
+
+    return {
+        "suffix": suffix,
+        "unmapped": unmapped,
+        "profiles": compiled,
+    }
+
+
+def sync_jailbreaks(root, force=False):
+    """按 prompts/manifest.yaml 的固定 commit 下载提示词到 prompts/upstream/。"""
+    root = Path(root)
+    _banner("poolctl sync-jailbreaks")
+    raw = _load_jailbreak_raw(root)
+    source = raw.get("source") or {}
+    if not isinstance(source, dict):
+        raise PoolctlError("%s 的 source 必须是映射(dict)" % JAILBREAK_MANIFEST)
+    repo = str(source.get("repo") or "").strip()
+    ref = str(source.get("ref") or "").strip()
+    base_url = str(source.get("base_url") or "https://raw.githubusercontent.com").rstrip("/")
+    if not repo or not ref:
+        raise PoolctlError("%s 的 source.repo / source.ref 不能为空" % JAILBREAK_MANIFEST)
+
+    profiles = raw.get("profiles")
+    if not isinstance(profiles, list) or not profiles:
+        raise PoolctlError("%s 的 profiles 必须是非空列表" % JAILBREAK_MANIFEST)
+
+    prompts_dir = root / "prompts"
+    written = 0
+    skipped = 0
+    for index, item in enumerate(profiles, 1):
+        if not isinstance(item, dict):
+            raise PoolctlError("profiles[%d] 必须是映射(dict)" % index)
+        source_file = str(item.get("source_file") or "").strip()
+        if not source_file:
+            _info("profiles[%d] 没有 source_file，跳过" % index)
+            skipped += 1
+            continue
+        dest = _prompt_path(prompts_dir, item.get("file"), "profiles[%d]" % index)
+        url = "%s/%s/%s/%s" % (
+            base_url,
+            repo,
+            ref,
+            urllib.parse.quote(source_file),
+        )
+        _emit("-- [%d/%d] %s" % (index, len(profiles), source_file))
+        try:
+            request = urllib.request.Request(
+                url,
+                headers={"User-Agent": "orca-ai-pool/poolctl"},
+            )
+            with urllib.request.urlopen(request, timeout=30) as response:
+                data = response.read()
+        except urllib.error.HTTPError as exc:
+            raise PoolctlError("下载失败 HTTP %s: %s" % (exc.code, url))
+        except urllib.error.URLError as exc:
+            raise PoolctlError("下载失败: %s (%s)" % (url, exc.reason))
+        text = data.decode("utf-8")
+        if not text.strip():
+            raise PoolctlError("上游文件为空: %s" % url)
+
+        if dest.exists() and not force:
+            existing = dest.read_text(encoding="utf-8")
+            if existing == text:
+                _ok("已是最新: %s" % dest.relative_to(root))
+            else:
+                _warn("已存在且内容不同，保留本地文件: %s（--force 覆盖）" % dest.relative_to(root))
+            skipped += 1
+            continue
+        atomic_write_text(dest, text)
+        _ok("已写入 %s (%d bytes)" % (dest.relative_to(root), len(data)))
+        written += 1
+
+    _emit("")
+    _info("来源: https://github.com/%s @ %s" % (repo, ref))
+    _warn("上游仓库未声明许可证；使用与再分发前请自行确认条款。")
+    _info("完成: 写入 %d，跳过 %d" % (written, skipped))
+    return 0
+
+
+def _jailbreak_model_matches(model, profiles):
+    """模型名是否命中任一破甲 profile（大小写不敏感，支持 * / ?）。"""
+    candidate = str(model or "").strip().lower()
+    if not candidate:
+        return False
+    for profile in profiles:
+        for pattern in profile.get("models", []):
+            if fnmatch.fnmatchcase(candidate, str(pattern).lower()):
+                return True
+    return False
+
+
+def _jailbreak_openai_model(model, profiles, suffix):
+    """给 OpenAI 兼容 model 条目复制一份带破甲后缀的 alias。"""
+    client_name = str(model.get("alias") or model.get("name") or "").strip()
+    if not _jailbreak_model_matches(client_name, profiles):
+        return None
+    aliased = dict(model)
+    aliased["alias"] = client_name + suffix
+    return aliased
+
+
+def _jailbreak_oauth_aliases(profiles, suffix):
+    """Devin OAuth 模型的破甲别名；fork=true 保留原模型。"""
+    aliases = []
+    for model in DEVIN_MODELS:
+        if _jailbreak_model_matches(model, profiles):
+            aliases.append({"name": model, "alias": model + suffix, "fork": True})
+    return aliases
+
+
+def _models_with_jailbreak(models, jailbreak):
+    result = [dict(model) for model in models]
+    if not jailbreak:
+        return result
+    for model in models:
+        aliased = _jailbreak_openai_model(model, jailbreak["profiles"], jailbreak["suffix"])
+        if aliased:
+            result.append(aliased)
+    return result
+
+
+def _jailbreak_alias_names(jailbreak):
+    """实际会出现在 /v1/models 里的破甲模型名（去重、保持顺序）。"""
+    names = []
+    if not jailbreak:
+        return names
+    profiles = jailbreak["profiles"]
+    suffix = jailbreak["suffix"]
+    for model in list(OC2API_GO_MODELS) + list(GOAT_MODELS):
+        client_name = str(model.get("alias") or model.get("name") or "").strip()
+        if client_name and _jailbreak_model_matches(client_name, profiles):
+            alias = client_name + suffix
+            if alias not in names:
+                names.append(alias)
+    for model in DEVIN_MODELS:
+        if _jailbreak_model_matches(model, profiles):
+            alias = model + suffix
+            if alias not in names:
+                names.append(alias)
+    return names
+
+
+def _build_cliproxy_config(env, mode, words, goat_keys, go_keys, monitor, jailbreak=None):
     # DISABLE_AUTH=true（.env，测试环境用）：access.api-keys 留空 = 客户端免鉴权。
     # 管理接口仍走 CPA_ADMIN_SECRET（secret-key 置空会把 /v0/management 整个关掉）。
     access_keys = [] if _env_flag(env, "DISABLE_AUTH") else [env["MASTER_API_KEY"]]
@@ -518,7 +862,9 @@ def _build_cliproxy_config(env, mode, words, goat_keys, go_keys, monitor):
         #   "127.0.0.1:18317:18317"
         "server": {
             "host": "",
-            "port": int(env.get("GATEWAY_INTERNAL_PORT") or DEFAULT_INTERNAL_PORT),
+            "port": _int_env(
+                env, "GATEWAY_INTERNAL_PORT", DEFAULT_INTERNAL_PORT
+            ),
         },
         "management": {"allow-remote": True, "secret-key": env["CPA_ADMIN_SECRET"]},
         "access": {"api-keys": access_keys},
@@ -548,6 +894,7 @@ def _build_cliproxy_config(env, mode, words, goat_keys, go_keys, monitor):
         "observability": {"usage": {"usage-statistics-enabled": True}},
         "oauth": {
             "auth-dir": "/root/.cli-proxy-api",
+            "settings": {"devin": list(DEVIN_MODEL_SETTINGS)},
             "excluded-models": {"devin": list(DEVIN_EXCLUDED_MODELS)},
             "request-scoped-errors": {
                 "devin": [
@@ -571,12 +918,17 @@ def _build_cliproxy_config(env, mode, words, goat_keys, go_keys, monitor):
                     "name": "opencode-go-pool",
                     "base-url": "http://opencode2api:8080/v1",
                     "support-prompt-cache-key": True,
-                    "models": [dict(model) for model in OC2API_GO_MODELS],
+                    "models": _models_with_jailbreak(OC2API_GO_MODELS, jailbreak),
                     "keys": [{"api-key": env["OC2API_SERVER_KEY"], "weight": 1}],
                 }
             ]
         },
     }
+
+    if jailbreak:
+        oauth_aliases = _jailbreak_oauth_aliases(jailbreak["profiles"], jailbreak["suffix"])
+        if oauth_aliases:
+            config["oauth-model-alias"] = {"devin": oauth_aliases}
 
     if goat_keys:
         config["api-keys"]["openai-compatibility"].append(
@@ -584,30 +936,42 @@ def _build_cliproxy_config(env, mode, words, goat_keys, go_keys, monitor):
                 "name": "command-code-goat",
                 "base-url": "https://api.commandcode.ai/provider/v1",
                 "support-prompt-cache-key": True,
-                "models": [dict(model) for model in GOAT_MODELS],
+                "models": _models_with_jailbreak(GOAT_MODELS, jailbreak),
                 "keys": [{"api-key": item["api_key"], "weight": item["weight"]} for item in goat_keys],
             }
         )
 
+    plugin_configs = {}
     if monitor.get("enabled", True):
-        plugin_config = {}
         # 自研 QuotaProvider+AuthProvider 插件：每个 Go key 成为 CPAMC
         # 配额管理页的一等凭据（render 生成的 opencode-go-*.json），
         # quota.fetch 按凭据单 key 查询，原生卡片渲染。
+        plugin_configs["opencode-go-quota"] = {
+            "enabled": True,
+            "priority": 1,
+            "opencode_api_base": "https://opencode.ai/zen/go/v1",
+            "opencode_api_keys": list(go_keys),
+            # 配额窗口是 5h/weekly/monthly 量级，60s 与 300s 的观测精度没有差别，
+            # 但 4 key × 60s ≈ 5760 次/天 的 quota 请求会跟业务流量抢同一个 key。
+            "refresh_seconds": 300,
+        }
+
+    if jailbreak:
+        # 破甲通道：客户端请求 <原模型名><suffix>，CPA 通过上方 alias 映射回
+        # 原模型/原上游；插件只负责按 RequestedModel 注入提示词。
+        plugin_configs["jailbreak-inject"] = {
+            "enabled": True,
+            "priority": 2,
+            "suffix": jailbreak["suffix"],
+            "unmapped": jailbreak["unmapped"],
+            "profiles": jailbreak["profiles"],
+        }
+
+    if plugin_configs:
         config["plugins"] = {
             "enabled": True,
             "dir": "plugins",
-            "configs": {
-                "opencode-go-quota": {
-                    "enabled": True,
-                    "priority": 1,
-                    "opencode_api_base": "https://opencode.ai/zen/go/v1",
-                    "opencode_api_keys": list(go_keys),
-                    # 配额窗口是 5h/weekly/monthly 量级，60s 与 300s 的观测精度没有差别，
-                    # 但 4 key × 60s ≈ 5760 次/天 的 quota 请求会跟业务流量抢同一个 key。
-                    "refresh_seconds": 300,
-                },
-            },
+            "configs": plugin_configs,
         }
     return config
 
@@ -683,9 +1047,11 @@ server {
         proxy_pass http://orca_cpa;
     }
 
-    # --- 已知不存在但被扫描器高频探测：直接掐断 ---
+    # --- 网关不支持 Files API：返回 404 而不是断连 ---
+    # dsh 等客户端收到干净的 404 会立刻回退到内联图片；
+    # 444 会被当成传输错误，可能重试并拖慢请求。
     location = /v1/files {
-        return 444;
+        return 404;
     }
 
     # --- 元数据：短缓存 + 在途合并（防冷启动惊群）；纯缓存，不是限流 ---
@@ -757,7 +1123,7 @@ server {
     }
 
     location = /v1/files {
-        return 444;
+        return 404;
     }
 
     location = /v1/models {
@@ -800,8 +1166,10 @@ proxy_connect_timeout 10s;
 
 def _build_nginx_conf(env):
     return NGINX_CONF % {
-        "port": int(env.get("GATEWAY_PORT") or DEFAULT_GATEWAY_PORT),
-        "internal_port": int(env.get("GATEWAY_INTERNAL_PORT") or DEFAULT_INTERNAL_PORT),
+        "port": _int_env(env, "GATEWAY_PORT", DEFAULT_GATEWAY_PORT),
+        "internal_port": _int_env(
+            env, "GATEWAY_INTERNAL_PORT", DEFAULT_INTERNAL_PORT
+        ),
         # 管理面稳态速率（每 IP）。突发额度见 burst：UI 资源 100，管理 API 30。
         "mgmt_rate": env.get("NGINX_MGMT_RATE") or "5r/s",
         "quota_rate": env.get("NGINX_QUOTA_RATE") or "12r/m",
@@ -986,6 +1354,45 @@ def _sync_opencode2api_container(root, config_path, env):
         _info("请手工执行: docker compose restart opencode2api")
 
 
+def _is_devin_auth_file(path):
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return isinstance(data, dict) and str(data.get("type", "")).lower() == "devin"
+
+
+def _remove_stale_auth_files(auths_dir, expected_devin, expected_go):
+    auths_dir = Path(auths_dir)
+    for stale in sorted(auths_dir.glob("opencode-go-*.json")):
+        if stale.name in expected_go:
+            continue
+        try:
+            stale.unlink()
+            _warn("已删除过期凭据: %s" % stale.name)
+        except OSError as exc:
+            _warn("删除过期凭据失败 %s: %s" % (stale, exc))
+
+    for stale in sorted(auths_dir.glob("*.json")):
+        if stale.name in expected_devin:
+            continue
+        if stale.name.startswith("opencode-go-"):
+            continue
+        if not (
+            stale.name.startswith("devin-")
+            or _is_devin_auth_file(stale)
+        ):
+            continue
+        try:
+            stale.unlink()
+            _warn(
+                "已删除过期凭据: %s（不在当前 accounts.yaml 清单中）"
+                % stale.name
+            )
+        except OSError as exc:
+            _warn("删除过期凭据失败 %s: %s" % (stale, exc))
+
+
 def render(root):
     """从 accounts.yaml + .env 渲染三处产物。返回 0 表示成功。"""
     root = Path(root)
@@ -993,6 +1400,7 @@ def render(root):
     config = load_accounts(root)
     env = load_env(root)
     _require_env(env, REQUIRED_ENV_KEYS, root)
+    _warn_private_file_permissions(root)
 
     for key, reason in _secret_problems(env):
         _warn("%s %s；请执行 poolctl rotate-secret 轮换" % (key, reason))
@@ -1031,6 +1439,10 @@ def render(root):
                     "command_code_goat_pool.keys 第 %d 项 weight 必须是整数，当前值: %r"
                     % (index, weight_raw)
                 )
+            if weight < 1:
+                raise PoolctlError(
+                    "command_code_goat_pool.keys 第 %d 项 weight 必须 >= 1" % index
+                )
         else:
             raise PoolctlError("command_code_goat_pool.keys 第 %d 项必须是字符串或映射" % index)
         if not api_key:
@@ -1039,7 +1451,12 @@ def render(root):
 
     # --- 1. Devin 凭据 JSON ------------------------------------------------
     auths_dir = root / "cliproxy" / "auths"
-    auths_dir.mkdir(parents=True, exist_ok=True)
+    auths_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+        mode=SENSITIVE_DIR_MODE,
+    )
+    os.chmod(auths_dir, SENSITIVE_DIR_MODE)
     expected_names = set()
     max_count = 0
     pro_count = 0
@@ -1067,7 +1484,11 @@ def render(root):
             credential["excluded_models"] = list(PRO_EXCLUDED_MODELS) + list(DEVIN_EXCLUDED_MODELS)
         filename = "%s.json" % account["id"]
         expected_names.add(filename)
-        atomic_write_json(auths_dir / filename, credential)
+        atomic_write_json(
+            auths_dir / filename,
+            credential,
+            mode=SENSITIVE_FILE_MODE,
+        )
         _ok("凭据 %s (plan=%s, weight=%d%s)"
             % (
                 (auths_dir / filename).relative_to(root),
@@ -1084,22 +1505,11 @@ def render(root):
         atomic_write_json(
             auths_dir / pname,
             {"type": "opencode-go", "api_key": "__pool__", "name": "OpenCode Go Pool"},
+            mode=SENSITIVE_FILE_MODE,
         )
         expected_g.add(pname)
         _ok(f"凭据 {pname} (opencode-go 综合配额)")
-    for stale in sorted(auths_dir.glob("opencode-go-*.json")):
-        if stale.name not in expected_g:
-            stale.unlink()
-            _warn(f"已删除过期凭据: {stale.relative_to(root)}")
-
-    for stale in sorted(auths_dir.glob("devin-*.json")):
-        if stale.name in expected_names:
-            continue
-        try:
-            stale.unlink()
-            _warn("已删除过期凭据: %s（不在当前 accounts.yaml 清单中）" % stale.relative_to(root))
-        except OSError as exc:
-            _warn("删除过期凭据失败 %s: %s" % (stale, exc))
+    _remove_stale_auth_files(auths_dir, expected_names, expected_g)
 
     if not accounts:
         _warn("devin_pool.accounts 为空，未生成任何 Devin 凭据")
@@ -1108,10 +1518,23 @@ def render(root):
     if not isinstance(monitor, dict):
         raise PoolctlError("accounts.yaml 的 monitoring 必须是映射(dict)")
     monitor.setdefault("enabled", True)
+    jailbreak = load_jailbreak_config(root, config.get("jailbreak_channel"))
+    if jailbreak:
+        jailbreak_plugin = (
+            root / "cliproxy" / "plugins" / "linux" / "amd64" / "jailbreak-inject.so"
+        )
+        if not jailbreak_plugin.exists():
+            raise PoolctlError(
+                "破甲通道已启用，但未找到 %s\n"
+                "先执行: cd plugin/jailbreak-inject && make install"
+                % jailbreak_plugin
+            )
 
     # --- 2. cliproxy/config.yaml ------------------------------------------
     words = _sensitive_words(devin_pool)
-    cliproxy_config = _build_cliproxy_config(env, mode, words, goat_keys, go_keys, monitor)
+    cliproxy_config = _build_cliproxy_config(
+        env, mode, words, goat_keys, go_keys, monitor, jailbreak
+    )
     cliproxy_path = root / "cliproxy" / "config.yaml"
     cliproxy_text = YAML_HEADER + yaml.safe_dump(
         cliproxy_config,
@@ -1120,13 +1543,33 @@ def render(root):
         default_flow_style=False,
         width=120,
     )
-    atomic_write_text(cliproxy_path, cliproxy_text)
+    atomic_write_text(
+        cliproxy_path,
+        cliproxy_text,
+        mode=SENSITIVE_FILE_MODE,
+    )
     _ok("已生成 %s (config-version 8, mode=%s)" % (cliproxy_path.relative_to(root), mode))
+    if jailbreak:
+        _ok(
+            "破甲通道已启用: 后缀 %s，profiles=%d（%s）"
+            % (
+                jailbreak["suffix"],
+                len(jailbreak["profiles"]),
+                " / ".join(item["name"] for item in jailbreak["profiles"]),
+            )
+        )
+        _info("新增模型别名: %s" % ", ".join(_jailbreak_alias_names(jailbreak)))
+    else:
+        _info("破甲通道未启用（accounts.yaml 的 jailbreak_channel.enabled=false）")
 
     # --- 3. opencode2api/config.json --------------------------------------
     oc2api_config = _build_opencode2api_config(env, go_keys, proxies)
     oc2api_path = root / "opencode2api" / "config.json"
-    atomic_write_json(oc2api_path, oc2api_config)
+    atomic_write_json(
+        oc2api_path,
+        oc2api_config,
+        mode=SENSITIVE_FILE_MODE,
+    )
     _ok("已生成 %s (go_keys=%d, proxies=%d)" % (oc2api_path.relative_to(root), len(go_keys), len(proxies)))
 
     # --- 4. nginx 入口配置 -------------------------------------------------
@@ -1182,7 +1625,7 @@ def render(root):
 # ---------------------------------------------------------------------------
 
 PLUGIN_STATE_FILE = ".poolctl-plugin-state.json"
-PLUGIN_CONFIG_IDS = ("opencode-go-quota",)
+PLUGIN_CONFIG_IDS = ("opencode-go-quota", "jailbreak-inject")
 
 
 def _plugin_snapshot(cliproxy_config):
@@ -1455,7 +1898,9 @@ def quota(root):
     secret = _env_secret(env, "CPA_ADMIN_SECRET", root)
 
     devin_rows = []
+    latest_files = []
     status, payload = _management_get(host, port, secret)
+    management_ok = status == 200
     if status == 0:
         _err("管理接口不可达 http://%s:%s : %s" % (host, port, _short(payload, 200)))
         _err("请确认 CLIProxyAPI (CPA) 容器已运行，且 GATEWAY_HOST/GATEWAY_PORT 配置正确")
@@ -1465,54 +1910,76 @@ def quota(root):
         _err("请确认 CPA_ADMIN_SECRET 与管理接口配置一致，且 CPA 已运行")
     else:
         files = _extract_files(payload)
+        latest_files = files
         devin_files = [item for item in files if str(item.get("type") or "").lower() == "devin"]
         if not devin_files:
             _info("CPA 中未找到 type==devin 的凭据文件")
-        for item in devin_files:
-            auth_index = (
-                item.get("auth_index")
-                or item.get("authIndex")
-                or item.get("index")
-                or item.get("id")
-                or item.get("name")
-            )
-            if auth_index is None:
-                _warn("凭据 %r 缺少 auth_index，跳过 refresh" % item.get("name"))
-                continue
-            refresh_status, refresh_payload = _http_json(
-                "POST",
-                "http://%s:%s/v0/management/auth-files/refresh" % (host, port),
-                headers={"Authorization": "Bearer %s" % secret},
-                payload={"auth_index": auth_index, "name": item.get("name") or auth_index},
-                timeout=45,
-            )
-            if refresh_status != 200:
-                raw = (
-                    refresh_payload
-                    if isinstance(refresh_payload, str)
-                    else json.dumps(refresh_payload, ensure_ascii=False)
-                )
-                _warn("刷新 %r 失败 HTTP %s: %s" % (item.get("name"), refresh_status, _short(raw, 200)))
-
-        status, payload = _management_get(host, port, secret)
-        if status == 200:
-            files = _extract_files(payload)
-            devin_files = [item for item in files if str(item.get("type") or "").lower() == "devin"]
+        if devin_files:
             for item in devin_files:
-                signals = _signals_map(item)
-                devin_rows.append(
-                    [
-                        item.get("name") or item.get("id") or "-",
-                        item.get("email") or "-",
-                        item.get("plan") or "-",
-                        _fmt_pct(_pick(signals, "daily_quota_remaining_percent")),
-                        _fmt_reset(_pick(signals, "daily_quota_reset_at", "daily_quota_reset_at_unix")),
-                        _fmt_pct(_pick(signals, "weekly_quota_remaining_percent")),
-                        _fmt_reset(_pick(signals, "weekly_quota_reset_at", "weekly_quota_reset_at_unix")),
-                    ]
+                auth_index = (
+                    item.get("auth_index")
+                    or item.get("authIndex")
+                    or item.get("index")
+                    or item.get("id")
+                    or item.get("name")
                 )
-        else:
-            _err("刷新后重新读取列表失败 HTTP %s" % status)
+                if auth_index is None:
+                    _warn("凭据 %r 缺少 auth_index，跳过 refresh" % item.get("name"))
+                    continue
+                refresh_status, refresh_payload = _http_json(
+                    "POST",
+                    "http://%s:%s/v0/management/auth-files/refresh" % (host, port),
+                    headers={"Authorization": "Bearer %s" % secret},
+                    payload={"auth_index": auth_index, "name": item.get("name") or auth_index},
+                    timeout=45,
+                )
+                if refresh_status != 200:
+                    raw = (
+                        refresh_payload
+                        if isinstance(refresh_payload, str)
+                        else json.dumps(refresh_payload, ensure_ascii=False)
+                    )
+                    _warn(
+                        "刷新 %r 失败 HTTP %s: %s"
+                        % (item.get("name"), refresh_status, _short(raw, 200))
+                    )
+
+            status, payload = _management_get(host, port, secret)
+            if status == 200:
+                files = _extract_files(payload)
+                latest_files = files
+                devin_files = [
+                    item
+                    for item in files
+                    if str(item.get("type") or "").lower() == "devin"
+                ]
+                for item in devin_files:
+                    signals = _signals_map(item)
+                    devin_rows.append(
+                        [
+                            item.get("name") or item.get("id") or "-",
+                            item.get("email") or "-",
+                            item.get("plan") or "-",
+                            _fmt_pct(_pick(signals, "daily_quota_remaining_percent")),
+                            _fmt_reset(
+                                _pick(
+                                    signals,
+                                    "daily_quota_reset_at",
+                                    "daily_quota_reset_at_unix",
+                                )
+                            ),
+                            _fmt_pct(_pick(signals, "weekly_quota_remaining_percent")),
+                            _fmt_reset(
+                                _pick(
+                                    signals,
+                                    "weekly_quota_reset_at",
+                                    "weekly_quota_reset_at_unix",
+                                )
+                            ),
+                        ]
+                    )
+            else:
+                _err("刷新后重新读取列表失败 HTTP %s" % status)
 
     print_table(
         "Devin 号池实时配额（CPA /v0/management/auth-files）",
@@ -1538,14 +2005,16 @@ def quota(root):
     goat_count = len(_as_list(goat_pool.get("keys"), "command_code_goat_pool.keys"))
 
     # OpenCode Go 实时余量（自研 opencode-go-quota 插件，逐凭据 quota.fetch）
-    _, files_payload = _management_get(host, port, secret)
     usage_rows = []
-    go_auths = [
-        item for item in _as_list((files_payload or {}).get("files"), "files")
-        if isinstance(item, dict) and item.get("provider") == "opencode-go"
-    ]
+    go_auths = []
+    for item in latest_files:
+        provider = str(
+            item.get("provider") or item.get("type") or ""
+        ).lower()
+        if provider == "opencode-go":
+            go_auths.append(item)
     for entry in go_auths:
-        fname = entry.get("name") or "-"
+        fname = entry.get("name") or entry.get("id") or "-"
         auth_index = entry.get("auth_index")
         if not auth_index:
             continue
@@ -1561,6 +2030,8 @@ def quota(root):
             for b in _as_list(buckets, ",".join(wnames)):
                 if isinstance(b, dict) and b.get("window") in wnames:
                     frac = b.get("remainingFraction")
+                    if frac is None or frac == "":
+                        return "-", "-"
                     try:
                         pct_text = "%.1f%%" % (float(frac) * 100)
                     except (TypeError, ValueError):
@@ -1576,19 +2047,44 @@ def quota(root):
                     return pct_text, _fmt_reset(secs)
             return "-", "-"
 
-        if q_status == 200 and isinstance(q_payload, dict):
-            groups = _as_list(q_payload.get("groups"), "groups")
-            buckets = (groups[0] or {}).get("buckets") if groups else []
+        def _append_usage_row(label, state, buckets):
             roll_pct, roll_reset = _bucket(buckets, "5h", "rolling")
             week_pct, week_reset = _bucket(buckets, "weekly")
             month_pct, month_reset = _bucket(buckets, "monthly")
-            state = "ok"
+            usage_rows.append(
+                [
+                    label,
+                    state,
+                    roll_pct,
+                    roll_reset,
+                    week_pct,
+                    week_reset,
+                    month_pct,
+                    month_reset,
+                ]
+            )
+
+        if q_status == 200 and isinstance(q_payload, dict):
+            groups = _as_list(q_payload.get("groups"), "groups")
+            if not groups:
+                _append_usage_row(fname, "empty", [])
+            for group in groups:
+                if not isinstance(group, dict):
+                    continue
+                buckets = group.get("buckets") or []
+                has_status_error = any(
+                    isinstance(bucket, dict)
+                    and bucket.get("window") == "status"
+                    for bucket in _as_list(buckets, "buckets")
+                )
+                _append_usage_row(
+                    group.get("displayName") or fname,
+                    "error" if has_status_error else "ok",
+                    buckets,
+                )
         else:
-            roll_pct = roll_reset = week_pct = week_reset = month_pct = month_reset = "-"
             state = "fail:%s" % _short(q_payload if q_status else "unreachable", 60)
-        usage_rows.append(
-            [fname, state, roll_pct, roll_reset, week_pct, week_reset, month_pct, month_reset]
-        )
+            _append_usage_row(fname, state, [])
     if not go_auths:
         _warn("未发现 opencode-go 凭据（先运行 poolctl render 并重启 CPA）")
 
@@ -1641,7 +2137,7 @@ def quota(root):
     _info(
         "多账号余量: CPAMC 配额管理页 opencode-go-* 凭据卡片"
     )
-    return 0
+    return 0 if management_ok else 1
 
 
 # ---------------------------------------------------------------------------
@@ -1681,6 +2177,7 @@ def switch_mode(root, target, force=False):
     backup_path = path.with_name(path.name + ".bak")
     try:
         shutil.copy2(str(path), str(backup_path))
+        os.chmod(backup_path, SENSITIVE_FILE_MODE)
         _ok("已备份原清单: %s" % backup_path)
     except OSError as exc:
         raise PoolctlError("备份 accounts.yaml 失败: %s" % exc)
@@ -1688,7 +2185,11 @@ def switch_mode(root, target, force=False):
     pool["mode"] = target
     config["devin_pool"] = pool
     text = yaml.safe_dump(config, allow_unicode=True, sort_keys=False, default_flow_style=False, width=120)
-    atomic_write_text(path, text)
+    atomic_write_text(
+        path,
+        text,
+        mode=SENSITIVE_FILE_MODE,
+    )
     _ok("accounts.yaml 的 devin_pool.mode 已更新为 %s" % target)
     _info("注意: 写回使用 yaml.safe_dump，原文件中的 YAML 注释已丢失（备份在 %s）" % backup_path.name)
 
@@ -1735,8 +2236,10 @@ def export_client(root):
             ["devin/gemini-4-argon", "Devin OAuth", "逆向工程主力（C/C++ 重构与文档）"],
             ["devin/swe-2-lightning", "Devin OAuth (Fast On)", "付费加速，仅在赶工时使用"],
             ["deepseek-v4.1-flash", "OpenCode Go + GOAT 聚合", "执行池，批量改代码/跑测试"],
+            ["deepseek-v4.1-flash-jailbreak", "同上（同一上游）", "破甲版，注入 DeepSeek 4.1 提示词"],
         ],
     )
+    _info("破甲模型名以 GET /v1/models 为准；在 accounts.yaml 打开 jailbreak_channel 后出现")
 
     devin_config = {"subagents": {"enabled": False}, "reasoningEffort": "high", "fastMode": False}
     _emit("")
@@ -1759,22 +2262,24 @@ def export_client(root):
 def rotate_secret(root, which):
     """生成强随机密钥写回 .env，并备份原文件。不自动 render。
 
-    which = all | admin | master | webui
+    which = all | admin | master | server | webui
     """
     root = Path(root)
     env_path = root / ".env"
     if not env_path.exists():
         raise PoolctlError("未找到 %s" % env_path)
-    env = load_env(root)
     mapping = {
         "admin": ("CPA_ADMIN_SECRET", "sk-"),
         "master": ("MASTER_API_KEY", "sk-"),
+        "server": ("OC2API_SERVER_KEY", "sk-"),
         "webui": ("OC2API_WEBUI_PASSWORD", "sk-"),
     }
     targets = list(mapping) if which in (None, "all") else [which]
     for name in targets:
         if name not in mapping:
-            raise PoolctlError("未知目标: %s（可选 all/admin/master/webui）" % name)
+            raise PoolctlError(
+                "未知目标: %s（可选 all/admin/master/server/webui）" % name
+            )
 
     backup = root / (".env.bak.%s" % time.strftime("%Y%m%d-%H%M%S"))
     shutil.copy2(env_path, backup)
@@ -1792,11 +2297,16 @@ def rotate_secret(root, which):
         updated = pattern.sub(lambda m: m.group(1) + new_value, updated)
         changed.append(key)
 
-    env_path.write_text(updated, encoding="utf-8")
-    os.chmod(env_path, 0o600)
+    atomic_write_text(
+        env_path,
+        updated,
+        mode=SENSITIVE_FILE_MODE,
+    )
     for key in changed:
         _ok("已轮换 %s（192 bit）" % key)
     _info("原文件备份: %s" % backup)
+    if "OC2API_SERVER_KEY" in changed:
+        _warn("内网 key 变更后需重启 cliproxyapi 与 opencode2api，否则两端认证会不一致")
     _warn("密钥已写入 .env，但配置尚未重新渲染；下一步执行 poolctl render 并重启对应服务")
     return 0
 
@@ -1809,7 +2319,7 @@ def rotate_secret(root, which):
 def build_parser():
     parser = argparse.ArgumentParser(
         prog="poolctl.py",
-        description="orca-ai-pool 运维 CLI（渲染配置 / 账号体检 / 配额查看 / 模式切换 / 客户端导出）",
+        description="orca-ai-pool 运维 CLI（渲染配置 / 账号体检 / 配额查看 / 模式切换 / 提示词同步 / 客户端导出）",
     )
     parser.add_argument(
         "--repo",
@@ -1842,8 +2352,8 @@ def build_parser():
         "which",
         nargs="?",
         default="all",
-        choices=["all", "admin", "master", "webui"],
-        help="轮换哪个密钥，默认 all",
+        choices=["all", "admin", "master", "server", "webui"],
+        help="轮换哪个密钥（all/admin/master/server/webui），默认 all",
     )
     rotate_parser.add_argument("--repo", metavar="DIR", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     rotate_parser.set_defaults(handler="rotate-secret")
@@ -1851,6 +2361,11 @@ def build_parser():
     export_parser = subparsers.add_parser("export-client", help="导出本地开发机环境变量与模型路由建议")
     export_parser.add_argument("--repo", metavar="DIR", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     export_parser.set_defaults(handler="export-client")
+
+    sync_parser = subparsers.add_parser("sync-jailbreaks", help="按固定 commit 下载破甲通道提示词")
+    sync_parser.add_argument("--force", action="store_true", help="覆盖本地已存在的提示词文件")
+    sync_parser.add_argument("--repo", metavar="DIR", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    sync_parser.set_defaults(handler="sync-jailbreaks")
 
     return parser
 
@@ -1876,6 +2391,8 @@ def main(argv=None):
             return rotate_secret(root, args.which)
         if args.handler == "export-client":
             return export_client(root)
+        if args.handler == "sync-jailbreaks":
+            return sync_jailbreaks(root, force=args.force)
     except PoolctlError as exc:
         _err(str(exc))
         return 2
