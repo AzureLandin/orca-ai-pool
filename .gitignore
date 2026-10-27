@@ -1,6 +1,8 @@
 # 密钥与真实号池清单
 .env
+.env.bak.*
 accounts.yaml
+accounts.yaml.bak
 
 # render 产物（example 文件不受影响：config.yaml.example / config.json.example）
 cliproxy/auths/*.json
@@ -8,6 +10,7 @@ cliproxy/config.yaml
 cliproxy/logs/
 cliproxy/plugins/
 opencode2api/config.json
+nginx/
 
 # 客户端导出
 export/

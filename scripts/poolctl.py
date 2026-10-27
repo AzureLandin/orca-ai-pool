@@ -9,7 +9,8 @@
     ./scripts/poolctl.py --repo /path/to/repo render
 
 依赖: Python 3.8+ 标准库 + PyYAML（import yaml）。
-子命令: render | check-opencode | quota | switch-mode | rotate-secret | export-client
+子命令: render | check-opencode | quota | switch-mode | rotate-secret |
+        sync-jailbreaks | export-client
 """
 
 import argparse
@@ -39,6 +40,8 @@ import yaml
 DEFAULT_GATEWAY_PORT = 8317
 # nginx 后面的 CPA 回环端口。公网 GATEWAY_PORT 由 nginx 占用，CPA 只听这个内部端口。
 DEFAULT_INTERNAL_PORT = 18317
+SENSITIVE_FILE_MODE = 0o600
+SENSITIVE_DIR_MODE = 0o700
 OC2API_WEBUI_URL = "http://127.0.0.1:18081"
 OC2API_CONTAINER_CONFIG_PATH = "/var/lib/opencode2api/config.json"
 OC2API_SERVICE = "opencode2api"
@@ -86,19 +89,30 @@ JAILBREAK_MODES = ("prepend", "append", "replace")
 # 协议（/inference/go/google/v1beta），opencode2api 仅支持 chat/responses/anthropic
 # 三种协议转换，无法桥接，仅由 Devin oauth 通道提供（devin/gemini-4-argon）。
 OC2API_GO_MODELS = [
-    {"name": "deepseek-v4.1-flash", "alias": "deepseek-v4.1-flash"},
+    {
+        "name": "deepseek-v4.1-flash",
+        "alias": "deepseek-v4.1-flash",
+        "max-context-length": 1048576,
+        "thinking": {"levels": ["none", "low", "high", "max"]},
+    },
 ]
 
 GOAT_MODELS = [
-    {"name": "deepseek/deepseek-v4.1-flash", "alias": "deepseek-v4.1-flash"},
+    {
+        "name": "deepseek/deepseek-v4.1-flash",
+        "alias": "deepseek-v4.1-flash",
+        "max-context-length": 1048576,
+        "thinking": {"levels": ["none", "low", "high", "max"]},
+    },
 ]
 
 # Devin OAuth 通道对外暴露的模型（与 oauth.settings.devin 保持一致）
-DEVIN_MODELS = [
-    "devin/swe-2",
-    "devin/swe-2-lightning",
-    "devin/gemini-4-argon",
+DEVIN_MODEL_SETTINGS = [
+    {"name": "devin/swe-2", "max-context-length": 262144},
+    {"name": "devin/swe-2-lightning", "max-context-length": 262144},
+    {"name": "devin/gemini-4-argon", "max-context-length": 1048576},
 ]
+DEVIN_MODELS = [item["name"] for item in DEVIN_MODEL_SETTINGS]
 
 # Devin 凭据的模型目录有几十个上游模型，但号池只开放
 # swe-2 / swe-2-lightning / gemini-4-argon 三个（客户端按 devin/* 真实 ID 调用）。
@@ -227,14 +241,18 @@ def atomic_write_text(path, text, mode=None):
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
     with open(tmp, "w", encoding="utf-8", newline="\n") as handle:
+        if mode is not None:
+            os.fchmod(handle.fileno(), mode)
         handle.write(text)
-    if mode is not None:
-        os.chmod(tmp, mode)
     os.replace(tmp, path)
 
 
-def atomic_write_json(path, data):
-    atomic_write_text(path, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+def atomic_write_json(path, data, mode=None):
+    atomic_write_text(
+        path,
+        json.dumps(data, ensure_ascii=False, indent=2) + "\n",
+        mode=mode,
+    )
 
 
 def load_accounts(root):
@@ -323,14 +341,36 @@ def _require_env(env, keys, root):
         )
 
 
+def _warn_private_file_permissions(root):
+    for name in (".env", "accounts.yaml"):
+        path = Path(root) / name
+        try:
+            mode = path.stat().st_mode & 0o777
+        except OSError:
+            continue
+        if mode & 0o077:
+            _warn("%s 权限为 %04o，建议执行 chmod 600 %s" % (path, mode, name))
+
+
+def _int_env(env, key, default, minimum=1, maximum=65535):
+    raw = str(env.get(key) or default).strip()
+    if not raw.isdigit():
+        raise PoolctlError("%s 必须是整数，当前值: %r" % (key, raw))
+    value = int(raw)
+    if value < minimum or value > maximum:
+        raise PoolctlError(
+            "%s 必须在 %d..%d 之间，当前值: %d"
+            % (key, minimum, maximum, value)
+        )
+    return value
+
+
 def _gateway(env):
     host = str(env.get("GATEWAY_HOST") or "").strip()
     if not host:
         raise PoolctlError("缺少 GATEWAY_HOST，请检查 .env")
-    port = str(env.get("GATEWAY_PORT") or DEFAULT_GATEWAY_PORT).strip()
-    if not port.isdigit():
-        raise PoolctlError("GATEWAY_PORT 必须是整数，当前值: %r" % port)
-    return host, port
+    port = _int_env(env, "GATEWAY_PORT", DEFAULT_GATEWAY_PORT)
+    return host, str(port)
 
 
 def _env_secret(env, key, root):
@@ -436,6 +476,12 @@ def _devin_accounts(pool):
         if not token:
             raise PoolctlError("devin_pool.accounts[%s] 缺少 session_token" % account_id)
         plan = str(item.get("plan") or "Pro").strip()
+        if plan.lower() not in ("pro", "max"):
+            raise PoolctlError(
+                "devin_pool.accounts[%s].plan 只能是 Pro 或 Max，当前值: %r"
+                % (account_id, plan)
+            )
+        plan = "Max" if plan.lower() == "max" else "Pro"
         weight_raw = item.get("weight")
         if weight_raw is None or weight_raw == "":
             weight = None
@@ -491,7 +537,17 @@ WEAK_SECRET_VALUES = frozenset(
         "123456",
     }
 )
-# 密钥最短长度（字节）。CPA 会原样接收，弱密钥的唯一防线在这里。
+WEAK_SECRET_MARKERS = (
+    "change-me",
+    "change_me",
+    "changeme",
+    "replace-me",
+    "replace_me",
+    "your-",
+    "your_",
+    "placeholder",
+)
+# 密钥最短长度（字符）。CPA 会原样接收，弱密钥的唯一防线在这里。
 MIN_SECRET_LEN = 24
 
 
@@ -501,7 +557,11 @@ def _secret_problems(env):
     seen = {}
     # DISABLE_AUTH=true 时 MASTER_API_KEY 不参与鉴权，无需校验强度。
     keys = [] if _env_flag(env, "DISABLE_AUTH") else ["MASTER_API_KEY"]
-    keys += ["CPA_ADMIN_SECRET", "OC2API_WEBUI_PASSWORD"]
+    keys += [
+        "CPA_ADMIN_SECRET",
+        "OC2API_SERVER_KEY",
+        "OC2API_WEBUI_PASSWORD",
+    ]
     for key in keys:
         value = str(env.get(key) or "").strip()
         if not value:
@@ -509,6 +569,8 @@ def _secret_problems(env):
             continue
         if value.lower() in WEAK_SECRET_VALUES:
             problems.append((key, "是已知默认值"))
+        elif any(marker in value.lower() for marker in WEAK_SECRET_MARKERS):
+            problems.append((key, "仍是示例占位值"))
         elif len(value) < MIN_SECRET_LEN:
             problems.append((key, "长度 %d < %d" % (len(value), MIN_SECRET_LEN)))
         if value:
@@ -800,7 +862,9 @@ def _build_cliproxy_config(env, mode, words, goat_keys, go_keys, monitor, jailbr
         #   "127.0.0.1:18317:18317"
         "server": {
             "host": "",
-            "port": int(env.get("GATEWAY_INTERNAL_PORT") or DEFAULT_INTERNAL_PORT),
+            "port": _int_env(
+                env, "GATEWAY_INTERNAL_PORT", DEFAULT_INTERNAL_PORT
+            ),
         },
         "management": {"allow-remote": True, "secret-key": env["CPA_ADMIN_SECRET"]},
         "access": {"api-keys": access_keys},
@@ -830,6 +894,7 @@ def _build_cliproxy_config(env, mode, words, goat_keys, go_keys, monitor, jailbr
         "observability": {"usage": {"usage-statistics-enabled": True}},
         "oauth": {
             "auth-dir": "/root/.cli-proxy-api",
+            "settings": {"devin": list(DEVIN_MODEL_SETTINGS)},
             "excluded-models": {"devin": list(DEVIN_EXCLUDED_MODELS)},
             "request-scoped-errors": {
                 "devin": [
@@ -1101,8 +1166,10 @@ proxy_connect_timeout 10s;
 
 def _build_nginx_conf(env):
     return NGINX_CONF % {
-        "port": int(env.get("GATEWAY_PORT") or DEFAULT_GATEWAY_PORT),
-        "internal_port": int(env.get("GATEWAY_INTERNAL_PORT") or DEFAULT_INTERNAL_PORT),
+        "port": _int_env(env, "GATEWAY_PORT", DEFAULT_GATEWAY_PORT),
+        "internal_port": _int_env(
+            env, "GATEWAY_INTERNAL_PORT", DEFAULT_INTERNAL_PORT
+        ),
         # 管理面稳态速率（每 IP）。突发额度见 burst：UI 资源 100，管理 API 30。
         "mgmt_rate": env.get("NGINX_MGMT_RATE") or "5r/s",
         "quota_rate": env.get("NGINX_QUOTA_RATE") or "12r/m",
@@ -1287,6 +1354,45 @@ def _sync_opencode2api_container(root, config_path, env):
         _info("请手工执行: docker compose restart opencode2api")
 
 
+def _is_devin_auth_file(path):
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return isinstance(data, dict) and str(data.get("type", "")).lower() == "devin"
+
+
+def _remove_stale_auth_files(auths_dir, expected_devin, expected_go):
+    auths_dir = Path(auths_dir)
+    for stale in sorted(auths_dir.glob("opencode-go-*.json")):
+        if stale.name in expected_go:
+            continue
+        try:
+            stale.unlink()
+            _warn("已删除过期凭据: %s" % stale.name)
+        except OSError as exc:
+            _warn("删除过期凭据失败 %s: %s" % (stale, exc))
+
+    for stale in sorted(auths_dir.glob("*.json")):
+        if stale.name in expected_devin:
+            continue
+        if stale.name.startswith("opencode-go-"):
+            continue
+        if not (
+            stale.name.startswith("devin-")
+            or _is_devin_auth_file(stale)
+        ):
+            continue
+        try:
+            stale.unlink()
+            _warn(
+                "已删除过期凭据: %s（不在当前 accounts.yaml 清单中）"
+                % stale.name
+            )
+        except OSError as exc:
+            _warn("删除过期凭据失败 %s: %s" % (stale, exc))
+
+
 def render(root):
     """从 accounts.yaml + .env 渲染三处产物。返回 0 表示成功。"""
     root = Path(root)
@@ -1294,6 +1400,7 @@ def render(root):
     config = load_accounts(root)
     env = load_env(root)
     _require_env(env, REQUIRED_ENV_KEYS, root)
+    _warn_private_file_permissions(root)
 
     for key, reason in _secret_problems(env):
         _warn("%s %s；请执行 poolctl rotate-secret 轮换" % (key, reason))
@@ -1332,6 +1439,10 @@ def render(root):
                     "command_code_goat_pool.keys 第 %d 项 weight 必须是整数，当前值: %r"
                     % (index, weight_raw)
                 )
+            if weight < 1:
+                raise PoolctlError(
+                    "command_code_goat_pool.keys 第 %d 项 weight 必须 >= 1" % index
+                )
         else:
             raise PoolctlError("command_code_goat_pool.keys 第 %d 项必须是字符串或映射" % index)
         if not api_key:
@@ -1340,7 +1451,12 @@ def render(root):
 
     # --- 1. Devin 凭据 JSON ------------------------------------------------
     auths_dir = root / "cliproxy" / "auths"
-    auths_dir.mkdir(parents=True, exist_ok=True)
+    auths_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+        mode=SENSITIVE_DIR_MODE,
+    )
+    os.chmod(auths_dir, SENSITIVE_DIR_MODE)
     expected_names = set()
     max_count = 0
     pro_count = 0
@@ -1368,7 +1484,11 @@ def render(root):
             credential["excluded_models"] = list(PRO_EXCLUDED_MODELS) + list(DEVIN_EXCLUDED_MODELS)
         filename = "%s.json" % account["id"]
         expected_names.add(filename)
-        atomic_write_json(auths_dir / filename, credential)
+        atomic_write_json(
+            auths_dir / filename,
+            credential,
+            mode=SENSITIVE_FILE_MODE,
+        )
         _ok("凭据 %s (plan=%s, weight=%d%s)"
             % (
                 (auths_dir / filename).relative_to(root),
@@ -1385,22 +1505,11 @@ def render(root):
         atomic_write_json(
             auths_dir / pname,
             {"type": "opencode-go", "api_key": "__pool__", "name": "OpenCode Go Pool"},
+            mode=SENSITIVE_FILE_MODE,
         )
         expected_g.add(pname)
         _ok(f"凭据 {pname} (opencode-go 综合配额)")
-    for stale in sorted(auths_dir.glob("opencode-go-*.json")):
-        if stale.name not in expected_g:
-            stale.unlink()
-            _warn(f"已删除过期凭据: {stale.relative_to(root)}")
-
-    for stale in sorted(auths_dir.glob("devin-*.json")):
-        if stale.name in expected_names:
-            continue
-        try:
-            stale.unlink()
-            _warn("已删除过期凭据: %s（不在当前 accounts.yaml 清单中）" % stale.relative_to(root))
-        except OSError as exc:
-            _warn("删除过期凭据失败 %s: %s" % (stale, exc))
+    _remove_stale_auth_files(auths_dir, expected_names, expected_g)
 
     if not accounts:
         _warn("devin_pool.accounts 为空，未生成任何 Devin 凭据")
@@ -1434,7 +1543,11 @@ def render(root):
         default_flow_style=False,
         width=120,
     )
-    atomic_write_text(cliproxy_path, cliproxy_text)
+    atomic_write_text(
+        cliproxy_path,
+        cliproxy_text,
+        mode=SENSITIVE_FILE_MODE,
+    )
     _ok("已生成 %s (config-version 8, mode=%s)" % (cliproxy_path.relative_to(root), mode))
     if jailbreak:
         _ok(
@@ -1452,7 +1565,11 @@ def render(root):
     # --- 3. opencode2api/config.json --------------------------------------
     oc2api_config = _build_opencode2api_config(env, go_keys, proxies)
     oc2api_path = root / "opencode2api" / "config.json"
-    atomic_write_json(oc2api_path, oc2api_config)
+    atomic_write_json(
+        oc2api_path,
+        oc2api_config,
+        mode=SENSITIVE_FILE_MODE,
+    )
     _ok("已生成 %s (go_keys=%d, proxies=%d)" % (oc2api_path.relative_to(root), len(go_keys), len(proxies)))
 
     # --- 4. nginx 入口配置 -------------------------------------------------
@@ -1781,7 +1898,9 @@ def quota(root):
     secret = _env_secret(env, "CPA_ADMIN_SECRET", root)
 
     devin_rows = []
+    latest_files = []
     status, payload = _management_get(host, port, secret)
+    management_ok = status == 200
     if status == 0:
         _err("管理接口不可达 http://%s:%s : %s" % (host, port, _short(payload, 200)))
         _err("请确认 CLIProxyAPI (CPA) 容器已运行，且 GATEWAY_HOST/GATEWAY_PORT 配置正确")
@@ -1791,54 +1910,76 @@ def quota(root):
         _err("请确认 CPA_ADMIN_SECRET 与管理接口配置一致，且 CPA 已运行")
     else:
         files = _extract_files(payload)
+        latest_files = files
         devin_files = [item for item in files if str(item.get("type") or "").lower() == "devin"]
         if not devin_files:
             _info("CPA 中未找到 type==devin 的凭据文件")
-        for item in devin_files:
-            auth_index = (
-                item.get("auth_index")
-                or item.get("authIndex")
-                or item.get("index")
-                or item.get("id")
-                or item.get("name")
-            )
-            if auth_index is None:
-                _warn("凭据 %r 缺少 auth_index，跳过 refresh" % item.get("name"))
-                continue
-            refresh_status, refresh_payload = _http_json(
-                "POST",
-                "http://%s:%s/v0/management/auth-files/refresh" % (host, port),
-                headers={"Authorization": "Bearer %s" % secret},
-                payload={"auth_index": auth_index, "name": item.get("name") or auth_index},
-                timeout=45,
-            )
-            if refresh_status != 200:
-                raw = (
-                    refresh_payload
-                    if isinstance(refresh_payload, str)
-                    else json.dumps(refresh_payload, ensure_ascii=False)
-                )
-                _warn("刷新 %r 失败 HTTP %s: %s" % (item.get("name"), refresh_status, _short(raw, 200)))
-
-        status, payload = _management_get(host, port, secret)
-        if status == 200:
-            files = _extract_files(payload)
-            devin_files = [item for item in files if str(item.get("type") or "").lower() == "devin"]
+        if devin_files:
             for item in devin_files:
-                signals = _signals_map(item)
-                devin_rows.append(
-                    [
-                        item.get("name") or item.get("id") or "-",
-                        item.get("email") or "-",
-                        item.get("plan") or "-",
-                        _fmt_pct(_pick(signals, "daily_quota_remaining_percent")),
-                        _fmt_reset(_pick(signals, "daily_quota_reset_at", "daily_quota_reset_at_unix")),
-                        _fmt_pct(_pick(signals, "weekly_quota_remaining_percent")),
-                        _fmt_reset(_pick(signals, "weekly_quota_reset_at", "weekly_quota_reset_at_unix")),
-                    ]
+                auth_index = (
+                    item.get("auth_index")
+                    or item.get("authIndex")
+                    or item.get("index")
+                    or item.get("id")
+                    or item.get("name")
                 )
-        else:
-            _err("刷新后重新读取列表失败 HTTP %s" % status)
+                if auth_index is None:
+                    _warn("凭据 %r 缺少 auth_index，跳过 refresh" % item.get("name"))
+                    continue
+                refresh_status, refresh_payload = _http_json(
+                    "POST",
+                    "http://%s:%s/v0/management/auth-files/refresh" % (host, port),
+                    headers={"Authorization": "Bearer %s" % secret},
+                    payload={"auth_index": auth_index, "name": item.get("name") or auth_index},
+                    timeout=45,
+                )
+                if refresh_status != 200:
+                    raw = (
+                        refresh_payload
+                        if isinstance(refresh_payload, str)
+                        else json.dumps(refresh_payload, ensure_ascii=False)
+                    )
+                    _warn(
+                        "刷新 %r 失败 HTTP %s: %s"
+                        % (item.get("name"), refresh_status, _short(raw, 200))
+                    )
+
+            status, payload = _management_get(host, port, secret)
+            if status == 200:
+                files = _extract_files(payload)
+                latest_files = files
+                devin_files = [
+                    item
+                    for item in files
+                    if str(item.get("type") or "").lower() == "devin"
+                ]
+                for item in devin_files:
+                    signals = _signals_map(item)
+                    devin_rows.append(
+                        [
+                            item.get("name") or item.get("id") or "-",
+                            item.get("email") or "-",
+                            item.get("plan") or "-",
+                            _fmt_pct(_pick(signals, "daily_quota_remaining_percent")),
+                            _fmt_reset(
+                                _pick(
+                                    signals,
+                                    "daily_quota_reset_at",
+                                    "daily_quota_reset_at_unix",
+                                )
+                            ),
+                            _fmt_pct(_pick(signals, "weekly_quota_remaining_percent")),
+                            _fmt_reset(
+                                _pick(
+                                    signals,
+                                    "weekly_quota_reset_at",
+                                    "weekly_quota_reset_at_unix",
+                                )
+                            ),
+                        ]
+                    )
+            else:
+                _err("刷新后重新读取列表失败 HTTP %s" % status)
 
     print_table(
         "Devin 号池实时配额（CPA /v0/management/auth-files）",
@@ -1864,14 +2005,16 @@ def quota(root):
     goat_count = len(_as_list(goat_pool.get("keys"), "command_code_goat_pool.keys"))
 
     # OpenCode Go 实时余量（自研 opencode-go-quota 插件，逐凭据 quota.fetch）
-    _, files_payload = _management_get(host, port, secret)
     usage_rows = []
-    go_auths = [
-        item for item in _as_list((files_payload or {}).get("files"), "files")
-        if isinstance(item, dict) and item.get("provider") == "opencode-go"
-    ]
+    go_auths = []
+    for item in latest_files:
+        provider = str(
+            item.get("provider") or item.get("type") or ""
+        ).lower()
+        if provider == "opencode-go":
+            go_auths.append(item)
     for entry in go_auths:
-        fname = entry.get("name") or "-"
+        fname = entry.get("name") or entry.get("id") or "-"
         auth_index = entry.get("auth_index")
         if not auth_index:
             continue
@@ -1887,6 +2030,8 @@ def quota(root):
             for b in _as_list(buckets, ",".join(wnames)):
                 if isinstance(b, dict) and b.get("window") in wnames:
                     frac = b.get("remainingFraction")
+                    if frac is None or frac == "":
+                        return "-", "-"
                     try:
                         pct_text = "%.1f%%" % (float(frac) * 100)
                     except (TypeError, ValueError):
@@ -1902,19 +2047,44 @@ def quota(root):
                     return pct_text, _fmt_reset(secs)
             return "-", "-"
 
-        if q_status == 200 and isinstance(q_payload, dict):
-            groups = _as_list(q_payload.get("groups"), "groups")
-            buckets = (groups[0] or {}).get("buckets") if groups else []
+        def _append_usage_row(label, state, buckets):
             roll_pct, roll_reset = _bucket(buckets, "5h", "rolling")
             week_pct, week_reset = _bucket(buckets, "weekly")
             month_pct, month_reset = _bucket(buckets, "monthly")
-            state = "ok"
+            usage_rows.append(
+                [
+                    label,
+                    state,
+                    roll_pct,
+                    roll_reset,
+                    week_pct,
+                    week_reset,
+                    month_pct,
+                    month_reset,
+                ]
+            )
+
+        if q_status == 200 and isinstance(q_payload, dict):
+            groups = _as_list(q_payload.get("groups"), "groups")
+            if not groups:
+                _append_usage_row(fname, "empty", [])
+            for group in groups:
+                if not isinstance(group, dict):
+                    continue
+                buckets = group.get("buckets") or []
+                has_status_error = any(
+                    isinstance(bucket, dict)
+                    and bucket.get("window") == "status"
+                    for bucket in _as_list(buckets, "buckets")
+                )
+                _append_usage_row(
+                    group.get("displayName") or fname,
+                    "error" if has_status_error else "ok",
+                    buckets,
+                )
         else:
-            roll_pct = roll_reset = week_pct = week_reset = month_pct = month_reset = "-"
             state = "fail:%s" % _short(q_payload if q_status else "unreachable", 60)
-        usage_rows.append(
-            [fname, state, roll_pct, roll_reset, week_pct, week_reset, month_pct, month_reset]
-        )
+            _append_usage_row(fname, state, [])
     if not go_auths:
         _warn("未发现 opencode-go 凭据（先运行 poolctl render 并重启 CPA）")
 
@@ -1967,7 +2137,7 @@ def quota(root):
     _info(
         "多账号余量: CPAMC 配额管理页 opencode-go-* 凭据卡片"
     )
-    return 0
+    return 0 if management_ok else 1
 
 
 # ---------------------------------------------------------------------------
@@ -2007,6 +2177,7 @@ def switch_mode(root, target, force=False):
     backup_path = path.with_name(path.name + ".bak")
     try:
         shutil.copy2(str(path), str(backup_path))
+        os.chmod(backup_path, SENSITIVE_FILE_MODE)
         _ok("已备份原清单: %s" % backup_path)
     except OSError as exc:
         raise PoolctlError("备份 accounts.yaml 失败: %s" % exc)
@@ -2014,7 +2185,11 @@ def switch_mode(root, target, force=False):
     pool["mode"] = target
     config["devin_pool"] = pool
     text = yaml.safe_dump(config, allow_unicode=True, sort_keys=False, default_flow_style=False, width=120)
-    atomic_write_text(path, text)
+    atomic_write_text(
+        path,
+        text,
+        mode=SENSITIVE_FILE_MODE,
+    )
     _ok("accounts.yaml 的 devin_pool.mode 已更新为 %s" % target)
     _info("注意: 写回使用 yaml.safe_dump，原文件中的 YAML 注释已丢失（备份在 %s）" % backup_path.name)
 
@@ -2087,22 +2262,24 @@ def export_client(root):
 def rotate_secret(root, which):
     """生成强随机密钥写回 .env，并备份原文件。不自动 render。
 
-    which = all | admin | master | webui
+    which = all | admin | master | server | webui
     """
     root = Path(root)
     env_path = root / ".env"
     if not env_path.exists():
         raise PoolctlError("未找到 %s" % env_path)
-    env = load_env(root)
     mapping = {
         "admin": ("CPA_ADMIN_SECRET", "sk-"),
         "master": ("MASTER_API_KEY", "sk-"),
+        "server": ("OC2API_SERVER_KEY", "sk-"),
         "webui": ("OC2API_WEBUI_PASSWORD", "sk-"),
     }
     targets = list(mapping) if which in (None, "all") else [which]
     for name in targets:
         if name not in mapping:
-            raise PoolctlError("未知目标: %s（可选 all/admin/master/webui）" % name)
+            raise PoolctlError(
+                "未知目标: %s（可选 all/admin/master/server/webui）" % name
+            )
 
     backup = root / (".env.bak.%s" % time.strftime("%Y%m%d-%H%M%S"))
     shutil.copy2(env_path, backup)
@@ -2120,11 +2297,16 @@ def rotate_secret(root, which):
         updated = pattern.sub(lambda m: m.group(1) + new_value, updated)
         changed.append(key)
 
-    env_path.write_text(updated, encoding="utf-8")
-    os.chmod(env_path, 0o600)
+    atomic_write_text(
+        env_path,
+        updated,
+        mode=SENSITIVE_FILE_MODE,
+    )
     for key in changed:
         _ok("已轮换 %s（192 bit）" % key)
     _info("原文件备份: %s" % backup)
+    if "OC2API_SERVER_KEY" in changed:
+        _warn("内网 key 变更后需重启 cliproxyapi 与 opencode2api，否则两端认证会不一致")
     _warn("密钥已写入 .env，但配置尚未重新渲染；下一步执行 poolctl render 并重启对应服务")
     return 0
 
@@ -2170,8 +2352,8 @@ def build_parser():
         "which",
         nargs="?",
         default="all",
-        choices=["all", "admin", "master", "webui"],
-        help="轮换哪个密钥，默认 all",
+        choices=["all", "admin", "master", "server", "webui"],
+        help="轮换哪个密钥（all/admin/master/server/webui），默认 all",
     )
     rotate_parser.add_argument("--repo", metavar="DIR", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     rotate_parser.set_defaults(handler="rotate-secret")

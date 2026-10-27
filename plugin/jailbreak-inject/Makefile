@@ -9,7 +9,8 @@ install: build
 	cp $(TARGET) $(INSTALL_DIR)/
 
 test:
-	CGO_ENABLED=1 go test ./...
+	go vet ./...
+	CGO_ENABLED=1 go test -race ./...
 
 clean:
 	rm -f $(TARGET) jailbreak-inject.h
