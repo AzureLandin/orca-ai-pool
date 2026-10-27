@@ -1,6 +1,6 @@
 # 生产部署指引（新加坡服务器）
 
-> 目标机：`root@43.160.254.193`（Debian 13，Docker 26.1.5 + Compose 2.26.1 已装好，镜像已预拉）
+> 目标机：`root@<YOUR_SERVER_IP>`（Debian 13，Docker 26.1.5 + Compose 2.26.1 已装好，镜像已预拉）
 > 部署路径：`/opt/orca-ai-pool/`
 
 ---
@@ -15,13 +15,14 @@ cp .env.example .env && vim .env
 
 | 变量 | 填什么 | 生成方法 |
 |---|---|---|
-| `GATEWAY_HOST` | 服务器公网 IP | `43.160.254.193` |
+| `GATEWAY_HOST` | 服务器公网 IP | `<YOUR_SERVER_IP>` |
 | `GATEWAY_PORT` | 对外端口 | `8317` |
 | `MASTER_API_KEY` | 客户端访问 CPA 的主 Key | `openssl rand -hex 32` |
 | `CPA_ADMIN_SECRET` | CPAMC 管理面板/管理 API 密码 | `openssl rand -hex 24` |
 | `OC2API_SERVER_KEY` | CPA→opencode2api 内网认证 key | `openssl rand -hex 24` |
 | `OC2API_WEBUI_USER` | opencode2api WebUI 用户名 | `admin` |
 | `OC2API_WEBUI_PASSWORD` | WebUI 密码（≥10字符） | `openssl rand -hex 12` |
+| `DISABLE_AUTH` | 客户端是否免鉴权，生产**必须** `false` | 保持默认 `false` |
 
 生成示例（在本机跑，把输出填进 .env）：
 
@@ -69,24 +70,36 @@ python3 scripts/poolctl.py render
 python3 scripts/poolctl.py check-opencode
 
 # 3. 构建余量监控插件（opencode-go-quota.so → cliproxy/plugins/linux/amd64/）
+#    需要 Go 1.21+ 与 CGO；没有插件也能跑主网关，只是 CPAMC 少一张 Go 余量卡
 cd plugin/opencode-go-quota && make install && cd ../..
 
-# 4. 起栈
+# 4. 起栈（docker compose 会自动叠加 docker-compose.override.yml → 带 nginx 入口）
 docker compose up -d
 
 # 5. 验证（30 秒后）
-docker compose ps
+docker compose ps      # 两个容器：cliproxyapi / opencode2api（nginx 装在宿主机上）
 curl -s http://127.0.0.1:8317/v1/models \
   -H "Authorization: Bearer <MASTER_API_KEY>" | python3 -m json.tool | head -30
+# 绕过入口直连 CPA，用于区分「入口问题」和「CPA 问题」
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:18317/v1/models
 ```
 
 模型列表只含 `devin/swe-2`、`devin/swe-2-lightning`、`devin/gemini-4-argon`、`deepseek-v4.1-flash` 四个模型即成功。
 
 ## 第四步：面板访问
 
+> 8317 现在是 **nginx 入口**（`nginx/conf.d/orca.conf`，由 `poolctl render` 生成并拷到
+> `/etc/nginx/conf.d/`；公共代理片段在 `/etc/nginx/snippets/orca-proxy.conf`）。
+> **只有管理面限流**：`/management.html`、`/assets/*`（burst 100）、`/v0/management/*`、
+> `/v8/management/*`（burst 30），稳态 5 r/s per IP；插件配额端点单独 12 r/m（burst 5）。
+> **模型面 `/v1/*` 不限速、不限并发**——SSE 长流和并行子 agent 会自己放大瞬时并发，
+> 给模型面设桶最先打到的就是最该重试的请求。排障时走 `127.0.0.1:18317` 绕开入口。
+
+
 - **CPAMC 管理面板**：`http://<服务器IP>:8317/management.html`，密码 = `CPA_ADMIN_SECRET`
-- **Go 多账号余量**：CPAMC 配额管理页的 `opencode-go-pool.json` 凭据卡片（综合三行 + 逐 key 分组）
-- **opencode2api WebUI**：`http://127.0.0.1:18081`（只绑回环，需 SSH 转发：`ssh -L 18081:127.0.0.1:18081 root@43.160.254.193`），账号 `admin` / `OC2API_WEBUI_PASSWORD`
+- **Go 多账号余量**：CPAMC 配额管理页的 `opencode-go-pool.json` 凭据卡片（只给一行聚合，
+  单 key 明细请直接看 `opencode-go-N.json` 凭据）
+- **opencode2api WebUI**：`http://127.0.0.1:18081`（只绑回环，需 SSH 转发：`ssh -L 18081:127.0.0.1:18081 root@<YOUR_SERVER_IP>`），账号 `admin` / `OC2API_WEBUI_PASSWORD`
 
 ## 常用运维命令
 
@@ -102,5 +115,15 @@ curl -s http://127.0.0.1:8317/v1/models \
 
 ## 防火墙提醒
 
-- 8317 公网已放行（实测 200）。如果只要管理面板用、不想暴露管理 API，把 `management.allow-remote` 改 `false` 后用 SSH 转发访问。
-- 18081 已绑定 `127.0.0.1`，外部访问必须走 SSH 隧道。
+- **8317 是唯一该放行的端口**，现在是 nginx 入口（仅管理面限速 + 429 JSON，`/v1` 纯透传）。
+- `18317` 是 CPA 的宿主机回环端口（`127.0.0.1`），只用于排障，绝不要对公网开放。
+- `18081` 已绑定 `127.0.0.1`，外部访问必须走 SSH 隧道；`8080` 未发布到宿主机。
+- 回滚到「CPA 直接对外」：把 `docker-compose.yml` 的端口改回 `"8317:8317"`、
+  `poolctl render` 前把 `GATEWAY_INTERNAL_PORT` 设成 8317（或直接改 `cliproxy/config.yaml` 的
+  `server.port`），然后 `systemctl stop nginx && docker compose up -d cliproxyapi`。
+  注意回滚后管理面**失去限流**，只剩 CPA 自己的「5 次失败封 IP 30 分钟」。
+
+## 容量与选型
+
+号数怎么定、缓存命中率为什么是决定性的、SWE-2 的免费口径冲突，见
+[`docs/capacity-planning.md`](docs/capacity-planning.md)。

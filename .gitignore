@@ -20,3 +20,6 @@ __pycache__/
 .DS_Store
 plugin/*/opencode-go-quota.so
 plugin/*/opencode-go-quota.h
+
+# poolctl 插件漂移检测的运行时状态
+.poolctl-plugin-state.json
