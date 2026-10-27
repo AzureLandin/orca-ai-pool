@@ -982,9 +982,11 @@ server {
         proxy_pass http://orca_cpa;
     }
 
-    # --- 已知不存在但被扫描器高频探测：直接掐断 ---
+    # --- 网关不支持 Files API：返回 404 而不是断连 ---
+    # dsh 等客户端收到干净的 404 会立刻回退到内联图片；
+    # 444 会被当成传输错误，可能重试并拖慢请求。
     location = /v1/files {
-        return 444;
+        return 404;
     }
 
     # --- 元数据：短缓存 + 在途合并（防冷启动惊群）；纯缓存，不是限流 ---
@@ -1056,7 +1058,7 @@ server {
     }
 
     location = /v1/files {
-        return 444;
+        return 404;
     }
 
     location = /v1/models {
