@@ -47,7 +47,8 @@ routing:
   strategy: "weighted-round-robin"
   session-affinity: true
   session-affinity-ttl: "2h"
-  session-affinity-subagents: false
+  session-affinity-subagents: true
+  session-affinity-rebind-on: quota
   retry:
     request-retry: 3
     max-retry-credentials: 0
@@ -143,4 +144,4 @@ plugins:
       priority: 1
       opencode_api_base: "https://opencode.ai/zen/go/v1"
       opencode_api_keys: []     # render 填充 opencode_go_pool.keys
-      refresh_seconds: 60
+      refresh_seconds: 300

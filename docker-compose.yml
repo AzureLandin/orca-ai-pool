@@ -1,7 +1,7 @@
 # orca-ai-pool — CPA(CLIProxyAPI) 主网关 + opencode2api 副网关
 #
 # 拓扑：
-#   本地 Orca ──> cliproxyapi:8317 ──┬─> Devin (OAuth, 原生 provider)
+#   本地 Orca ──> nginx:8317 ──> cliproxyapi:18317 ──┬─> Devin (OAuth, 原生 provider)
 #                                   ├─> opencode2api:8080 (内网) ──> OpenCode Go
 #                                   └─> command-code-goat (GOAT 直连, 公网)
 #
@@ -47,7 +47,8 @@ services:
     container_name: cliproxyapi
     restart: unless-stopped
     ports:
-      - "8317:8317"
+      # 只发布到回环：公网口 8317/443 由 nginx 前置，管理面才能被 limit_req 约束
+      - "127.0.0.1:18317:18317"
     volumes:
       - ./cliproxy/config.yaml:/CLIProxyAPI/config.yaml:ro
       - ./cliproxy/auths:/root/.cli-proxy-api
@@ -58,8 +59,8 @@ services:
       opencode2api:
         condition: service_started
     healthcheck:
-      # 镜像内无 wget/curl，但有 bash——用 /dev/tcp 探测 8317（仅 TCP 层连通性）
-      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/8317'"]
+      # 镜像内无 wget/curl，但有 bash——用 /dev/tcp 探测内部端口（仅 TCP 层连通性）
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/18317'"]
       interval: 30s
       timeout: 10s
       retries: 3
