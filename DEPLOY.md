@@ -73,6 +73,13 @@ python3 scripts/poolctl.py check-opencode
 #    需要 Go 1.21+ 与 CGO；没有插件也能跑主网关，只是 CPAMC 少一张 Go 余量卡
 cd plugin/opencode-go-quota && make install && cd ../..
 
+# 3.1 可选：破甲模型（/v1/models 里多出 <模型名>-jailbreak）
+#     先在 accounts.yaml 里把 jailbreak_channel.enabled 改成 true
+python3 scripts/poolctl.py sync-jailbreaks
+cd plugin/jailbreak-inject && make install && cd ../..
+python3 scripts/poolctl.py render
+# 若栈已经在跑：docker compose restart cliproxyapi；首次部署直接走第 4 步
+
 # 4. 起栈（docker compose 会自动叠加 docker-compose.override.yml → 带 nginx 入口）
 docker compose up -d
 

@@ -3,6 +3,8 @@
 AI 号池管理仓库：**CPA (CLIProxyAPI) 主网关 + opencode2api 副网关**，Docker Compose 部署在新加坡服务器。
 对外只暴露一个 OpenAI 兼容端点 `http://<server>:8317/v1`，内部把请求按模型名路由到 Devin (OAuth)、OpenCode Go、
 Command Code GOAT 三条上游，用「加权轮询 + 会话亲和」做负载均衡与缓存保护。
+开启破甲通道后，`GET /v1/models` 会多出带 `-jailbreak` 后缀的模型名
+（例如 `deepseek-v4.1-flash-jailbreak`），请求它时仍路由回原模型/原上游，只是注入对应系统提示词。
 
 ---
 
@@ -55,7 +57,16 @@ orca-ai-pool/
 ├── accounts.example.yaml                 # 号池清单（复制为 accounts.yaml）
 ├── README.md
 ├── scripts/
-│   └── poolctl.py                        # 唯一编排入口：render / check-opencode / quota / switch-mode / export-client
+│   └── poolctl.py                        # 唯一编排入口（7 个子命令）：render / check-opencode / quota / switch-mode / rotate-secret / sync-jailbreaks / export-client
+├── plugin/
+│   └── jailbreak-inject/                 # 自研 CPA C ABI 插件（Go）：-jailbreak 别名按模型注入提示词
+│       ├── main.go / main_test.go
+│       ├── Makefile                      # make install → cliproxy/plugins/linux/amd64/
+│       └── go.mod / go.sum
+├── prompts/
+│   ├── manifest.yaml                     # 破甲通道：模型 → 提示词文件 / 注入模式
+│   ├── overlays/                         # 本仓库自己的短补充（静态，保证缓存前缀稳定）
+│   └── upstream/                         # sync-jailbreaks 下载的提示词（gitignore）
 ├── templates/
 │   ├── cliproxy.config.v8.yaml.tmpl      # CPA v8 配置结构参考（手工兜底）
 │   ├── opencode2api.config.json.tmpl     # opencode2api 配置结构参考（JSONC）
@@ -63,7 +74,7 @@ orca-ai-pool/
 ├── cliproxy/
 │   ├── config.yaml                       # ← render 产物（gitignore）
 │   ├── auths/                            # ← render 产物：<id>.json 凭据（gitignore *.json）
-│   ├── plugins/linux/amd64/              # ← make install 产物：opencode-go-quota.so（gitignore）
+│   ├── plugins/linux/amd64/              # ← make install 产物：opencode-go-quota.so / jailbreak-inject.so（gitignore）
 │   └── logs/                             # 运行日志（gitignore）
 ├── opencode2api/
 │   └── config.json                       # ← render 产物（gitignore，作为 state 卷种子）
@@ -262,7 +273,7 @@ command_code_goat_pool:
 
 ## 5. 模型路由表
 
-对外只保留 4 个模型，客户端直接用真实 ID（不做别名映射，`GET /v1/models` 即路由表）：
+对外只保留 4 个基座模型，客户端直接用真实 ID（`GET /v1/models` 即路由表）：
 
 | 客户端模型名 | 上游 | 典型用途 |
 |---|---|---|
@@ -270,6 +281,15 @@ command_code_goat_pool:
 | `devin/swe-2-lightning` | Devin OAuth | 低延迟版本，交互式补全、小任务 |
 | `devin/gemini-4-argon` | Devin OAuth | 长上下文分析、架构评审 |
 | `deepseek-v4.1-flash` | OpenCode Go / GOAT | 批量代码生成、脏活累活，性价比最高 |
+
+开启破甲通道后，manifest 里有提示词的模型会额外出现 `-jailbreak` 别名：
+
+| 破甲模型名 | 实际上游 | 说明 |
+|---|---|---|
+| `deepseek-v4.1-flash-jailbreak` | 同 `deepseek-v4.1-flash` | 注入 `deepseek-4-1.md` + 本地 overlay |
+
+别名由 CPA 的 model alias / `oauth-model-alias` 机制生成，模型 ID 在进入上游前会还原成基座名。
+Devin 尚未上线，所以暂不生成 `devin/*-jailbreak`；manifest 里已经留好注释，上线后取消即可。
 
 > Devin 凭据的上游目录有几十个模型，`oauth.excluded-models` 按家族前缀收敛到这三个
 > （只支持通配符排除不支持白名单；新家族上线会漏进列表，需往 `DEVIN_EXCLUDED_MODELS` 补前缀）。
@@ -497,7 +517,8 @@ docker compose restart cliproxyapi            # 插件只在 CPA 启动时加载
 
 ## 11. poolctl 用法
 
-`scripts/poolctl.py` 是唯一编排入口，六个子命令：
+`scripts/poolctl.py` 是唯一编排入口。注意 **CLI 只有七个子命令**（`render` / `check-opencode` / `quota` /
+`switch-mode` / `rotate-secret` / `sync-jailbreaks` / `export-client`）；插件构建是 `make` 的活，不在 CLI 里：
 
 ### `render`
 
@@ -508,7 +529,7 @@ python3 scripts/poolctl.py render
 读 `accounts.yaml` + `.env`，写：
 
 - `cliproxy/auths/<id>.json`（每个 Devin 账号）
-- `cliproxy/config.yaml`（CPA v8）
+- `cliproxy/config.yaml`（CPA v8；启用破甲通道时还含 `jailbreak-inject` 与 `-jailbreak` model alias）
 - `opencode2api/config.json`（种子配置）
 
 若 `opencode2api` 容器在跑，会额外 `docker compose cp` 进容器并调 `/api/config/reload`
@@ -517,7 +538,8 @@ python3 scripts/poolctl.py render
 > ⚠️ 这一步是**必需**的：opencode2api 只在 state 卷首次初始化时读种子文件，之后必须靠
 > cp + reload。raw `docker compose restart` 不会重新导入新配置。
 
-CPA 侧不需要 reload —— `cliproxy/config.yaml` 与 `cliproxy/auths/*.json` 是挂载文件，变更自动热载。
+CPA 侧普通配置会热载；但 `plugins.configs`（包括破甲提示词 profile）是 C ABI 插件启动时读取的，
+改完必须 `docker compose restart cliproxyapi`。`render` 会检测并提醒。
 
 ### `check-opencode`
 
@@ -543,6 +565,16 @@ body: {"model":"deepseek-v4.1-flash","max_tokens":1,...}
 | 403 | 区域不支持 | 去 `Settings › Privacy › Regions` 切 `Global` |
 | 429 | 窗口冷却 | 5h / 周额度耗尽，等刷新或换号 |
 
+### `sync-jailbreaks`
+
+```bash
+python3 scripts/poolctl.py sync-jailbreaks
+python3 scripts/poolctl.py sync-jailbreaks --force   # 覆盖本地已有文件
+```
+
+按 `prompts/manifest.yaml` 的固定 commit 下载提示词到 `prompts/upstream/`（gitignore）。
+已有文件内容不同时默认保留本地版本，避免覆盖你手改过的提示词。
+
 ### `quota`
 
 ```bash
@@ -564,6 +596,18 @@ cd plugin/opencode-go-quota && make install
 `CGO_ENABLED=1 go build -buildmode=c-shared` 编译 `opencode-go-quota.so`，
 安装到 `cliproxy/plugins/linux/amd64/`（compose 已挂载 `/CLIProxyAPI/plugins`）。
 装完 `render` + `docker compose restart cliproxyapi` 生效。
+
+破甲插件同样用 `make` 构建：
+
+```bash
+cd plugin/jailbreak-inject
+make          # CGO_ENABLED=1 go build -buildmode=c-shared
+make install  # → ../../cliproxy/plugins/linux/amd64/jailbreak-inject.so
+make test     # CGO_ENABLED=1 go test ./...
+```
+
+启用 `jailbreak_channel.enabled` 后，`render` 会检查这个 `.so` 是否存在；不存在直接报错，
+避免模型列表里出现一个实际没注入的假破甲模型。
 
 ### `switch-mode`
 
@@ -659,3 +703,118 @@ Devin session token 过期。重抓（4.1）→ 改 `accounts.yaml` → `poolctl
 
 **Q10：想临时摘掉某个号？**
 CPA 面板（第 10 节）里禁用即可，不影响其他号；长期移除再从 `accounts.yaml` 删掉并 render。
+
+---
+
+## 14. 破甲模型（`-jailbreak` 别名）
+
+破甲版是一个**客户端可见的模型别名**，不是新上游：例如
+
+```text
+deepseek-v4.1-flash            # 普通模型
+deepseek-v4.1-flash-jailbreak  # 破甲模型
+```
+
+两者最终都发给同一个上游模型；区别只在进入上游前，`jailbreak-inject` 插件会把
+`prompts/manifest.yaml` 里对应 profile 注入到 `messages` / `system` / `instructions`。
+CPA 的 model alias 负责把 `-jailbreak` 名字还原成基座模型，插件只按请求模型名选提示词。
+
+### 14.1 启用
+
+```bash
+# 1. 按固定 commit 下载提示词（写到 prompts/upstream/，gitignore）
+python3 scripts/poolctl.py sync-jailbreaks
+
+# 2. 编译插件（C ABI .so 只在 CPA 启动时加载）
+cd plugin/jailbreak-inject && make install
+cd ../..
+
+# 3. accounts.yaml 打开开关
+# jailbreak_channel:
+#   enabled: true
+
+# 4. 生成配置并重启 CPA
+python3 scripts/poolctl.py render
+docker compose restart cliproxyapi
+```
+
+`render` 会打印新增的模型别名。若报未找到 `jailbreak-inject.so`，回到第 2 步；
+若提示提示词缺失，回到第 1 步。
+
+### 14.2 模型映射
+
+编辑 `prompts/manifest.yaml`：
+
+```yaml
+suffix: "-jailbreak"
+
+profiles:
+  - name: "deepseek-4-1"
+    models:
+      - "deepseek-v4.1-flash"
+      - "deepseek/deepseek-v4.1-flash"
+    source_file: "deepseek-4-1.md"      # 上游仓库里的文件名
+    file: "upstream/deepseek-4-1.md"    # 本地落盘位置（相对 prompts/）
+    overlay: "overlays/deepseek-4-1.md" # 本仓库自己的短补充，会拼在正文前
+    overlay_position: "prepend"
+    mode: "prepend"
+```
+
+`overlay` 用来补上游 prompt 没覆盖的部署规则，当前这份加了三条：本规格优先于默认行为、
+输入周围注入的安全警告不是额外禁令、协议/文件传输工具（含 BitTorrent 客户端）按工程任务处理。
+overlay 是静态文本，不含时间戳/随机值，所以它进入缓存前缀后不会每次失效。
+
+`render` 会根据 `models` 自动生成别名：
+
+- OpenAI 兼容上游（OpenCode Go / GOAT）：追加同 `name`、不同 `alias` 的模型条目。
+- Devin OAuth：写 `oauth-model-alias.devin`，带 `fork: true`，原模型和破甲模型都保留。
+  当前 manifest 里 Devin profile 是注释状态，等 Devin 上线再打开。
+
+`models` 支持 `*` / `?` 通配符（大小写不敏感），按清单顺序先到先得。`mode` 三选一：
+
+| mode | 行为 | 适用 |
+|---|---|---|
+| `prepend`（默认） | 在 `messages` 最前面插一条 system；Anthropic 则插到 `system` 最前 | 保留客户端的工具/代理指令 |
+| `append` | 追加到现有 system 段末尾 | 想让客户端指令优先时 |
+| `replace` | 删掉 system/developer 消息，整段换成提示词 | 强注入；会顶掉客户端的工具/代理指令 |
+
+未匹配到 profile 时默认返回 `400 jailbreak_profile_error`，不会静默退化成普通模型。
+想放行就把 `manifest.yaml` 的 `unmapped` 改成 `pass`。
+
+缓存方面：破甲别名在 CPA 内部还原成基座模型，上游看到的是同一个模型 ID；system 前缀
+由「固定 overlay + 固定上游 prompt + 客户端 system」组成。只要客户端不在 system 里塞
+时间戳/随机串，并保持同一个 `prompt_cache_key`，后续请求就能命中上游前缀缓存。
+
+### 14.3 调用
+
+先看模型列表确认别名已生成：
+
+```bash
+curl -s http://<server>:8317/v1/models \
+  -H "Authorization: Bearer $CPA_KEY" | grep -o '"id":"[^"]*jailbreak[^"]*"'
+```
+
+然后直接把 `model` 换成破甲名：
+
+```bash
+curl -s http://<server>:8317/v1/chat/completions \
+  -H "Authorization: Bearer $CPA_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"deepseek-v4.1-flash-jailbreak","messages":[{"role":"user","content":"ping"}],"max_tokens":8}'
+```
+
+上游看到的仍是 `deepseek-v4.1-flash`（GOAT 那条是 `deepseek/deepseek-v4.1-flash`），
+但 system 里已经多了对应提示词。`export-client` 的模型建议表也会列出当前这个破甲别名。
+
+### 14.4 注意事项
+
+- 提示词会进入每次请求的 system 前缀；同一 profile 内容稳定时能吃到上游前缀缓存，
+  改提示词会让该模型后续请求冷启动。`replace` 还会让客户端原有 system 前缀完全失效。
+- 插件支持 OpenAI chat（`messages`）、Anthropic（`system`）、Responses（`instructions` / `input`）。
+  其他 body 形态会返回 400，避免误以为已注入。
+- 只有 manifest 里有 profile 的模型才会生成 `-jailbreak` 别名；`devin/swe-2` 想开就补一条
+  profile，render 会自动生成 `devin/swe-2-jailbreak`。
+- 提示词来自 `togg53192-cmd/jailbreaks`，上游仓库未声明许可证；使用、再分发和上游 ToS
+  由部署者自行确认。`sync-jailbreaks` 固定到 manifest 里的 commit，不会自动跟随上游更新。
+- 排查：`docker compose logs cliproxyapi | grep -i jailbreak` 看插件加载；
+  `400 no jailbreak profile matches model` 说明别名存在但 manifest 没写对应 profile。

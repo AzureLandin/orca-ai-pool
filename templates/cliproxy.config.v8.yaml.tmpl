@@ -76,8 +76,8 @@ oauth:
         max-context-length: 262144
       - name: "devin/gemini-4-argon"
         max-context-length: 1048576
-  # 模型收敛：devin 家族前缀排除，仅保留 swe-2 / swe-2-lightning / gemini-4-argon
-  # （无 model-alias——客户端直接按 devin/* 真实 ID 调用）
+  # 模型收敛：devin 家族前缀排除，仅保留 swe-2 / swe-2-lightning / gemini-4-argon。
+  # 正常客户端直接按 devin/* 真实 ID 调用；破甲别名见下面的 oauth-model-alias。
   excluded-models:
     devin:
       - "devin/claude-*"
@@ -103,6 +103,14 @@ oauth:
       # 开关：填入词表即启用零宽混淆；空列表 = 关闭
       sensitive-words: []
 
+# 破甲通道的 Devin 别名：fork=true 表示保留原模型，同时新增一个客户端可见别名。
+# render 会按 prompts/manifest.yaml 自动生成；下面是手工兜底结构。
+# oauth-model-alias:
+#   devin:
+#     - name: "devin/gemini-4-argon"
+#       alias: "devin/gemini-4-argon-jailbreak"
+#       fork: true
+
 api-keys:
   openai-compatibility:
     - name: "opencode-go-pool"
@@ -115,6 +123,12 @@ api-keys:
           max-context-length: 1048576
           thinking:
             levels: ["none", "low", "high", "max"]
+        # 破甲通道启用时 render 会追加同 name、不同 alias 的条目：
+        # - name: "deepseek-v4.1-flash"
+        #   alias: "deepseek-v4.1-flash-jailbreak"
+        #   max-context-length: 1048576
+        #   thinking:
+        #     levels: ["none", "low", "high", "max"]
         # 注：gemini-4-argon 不进此池——上游为 Google 原生协议，opencode2api 无法桥接；
         # devin/gemini-4-argon 仅由 Devin oauth 通道提供
       # render 填充：{api-key: "{{OC2API_SERVER_KEY}}", weight: 1} 一条即可（内网网关单 key）
@@ -128,6 +142,9 @@ api-keys:
           max-context-length: 1048576
           thinking:
             levels: ["none", "low", "high", "max"]
+        # 破甲别名同样追加一条（name 保持上游 ID，alias 换成 -jailbreak）：
+        # - name: "deepseek/deepseek-v4.1-flash"
+        #   alias: "deepseek-v4.1-flash-jailbreak"
       # render 填充每个 GOAT key: {api-key, weight}
       keys: []
 
@@ -145,3 +162,18 @@ plugins:
       opencode_api_base: "https://opencode.ai/zen/go/v1"
       opencode_api_keys: []     # render 填充 opencode_go_pool.keys
       refresh_seconds: 300
+
+    # 破甲通道（自研 C ABI 插件 plugin/jailbreak-inject/）
+    # 正常流程由 render 从 prompts/manifest.yaml + prompts/upstream/*.md 生成；
+    # 下面是手工兜底结构，prompt 直接写提示词正文。
+    # jailbreak-inject:
+    #   enabled: true
+    #   priority: 2
+    #   suffix: "-jailbreak"
+    #   unmapped: "error"              # error | pass
+    #   profiles:
+    #     - name: "deepseek-4-1"
+    #       models: ["deepseek-v4.1-flash"]
+    #       mode: "prepend"            # prepend | append | replace
+    #       prompt: |
+    #         <PROMPT TEXT>

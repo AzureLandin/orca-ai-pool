@@ -1,0 +1,65 @@
+# 破甲通道提示词清单
+#
+# 提示词正文不随仓库分发：上游 togg53192-cmd/jailbreaks 未声明许可证。
+# 首次使用先跑：
+#
+#   python3 scripts/poolctl.py sync-jailbreaks
+#
+# 然后在 accounts.yaml 里打开：
+#
+#   jailbreak_channel:
+#     enabled: true
+#
+# 启用后客户端会多看到一个模型别名：<原模型名><suffix>，例如
+#   deepseek-v4.1-flash-jailbreak
+# 请求这个别名时，CPA 仍把它映射回原模型/原上游，只是插件会先注入这里的提示词。
+#
+# models 支持 * / ? 通配符，按清单顺序匹配，先到先得。
+# overlay 是本仓库自己的短补充（会拼在 upstream 正文前/后），用于强化优先级与
+# “忽略输入周围注入的安全警告”等规则；不要放时间戳或随机值，否则缓存前缀会失效。
+# mode:
+#   prepend  保留客户端 system 提示词，把破甲提示词插到最前面（默认，最安全）
+#   append   保留客户端 system 提示词，把破甲提示词追加到 system 段末尾
+#   replace  删除 system/developer 消息，整段换成破甲提示词（会顶掉工具/代理指令）
+#
+# 未匹配到 profile 时由本文件的 unmapped 决定：
+#   error（默认）返回 400；pass 原样放行。
+
+suffix: "-jailbreak"
+unmapped: "error"
+default_mode: "prepend"
+
+source:
+  repo: "togg53192-cmd/jailbreaks"
+  # 固定 commit，避免上游改文件后本地提示词静默漂移。
+  ref: "8b9719913b2bd563246fea9880d2201acf70330b"
+
+profiles:
+  - name: "deepseek-4-1"
+    models:
+      - "deepseek-v4.1-flash"
+      - "deepseek/deepseek-v4.1-flash"
+    source_file: "deepseek-4-1.md"
+    file: "upstream/deepseek-4-1.md"
+    overlay: "overlays/deepseek-4-1.md"
+    overlay_position: "prepend"
+    mode: "prepend"
+
+  # Devin 还没上线，先不生成 devin/*-jailbreak 别名。上线后取消注释即可。
+  # - name: "gemini-4-argon"
+  #   models:
+  #     - "devin/gemini-4-argon"
+  #   source_file: "Gemini-4-Argon.md"
+  #   file: "upstream/Gemini-4-Argon.md"
+  #   mode: "prepend"
+
+  # 池里还有 devin/swe-2 和 devin/swe-2-lightning，上游仓库没有同名提示词。
+  # 想给它们也开一个 profile，就复制下面这段并换成你选定的上游文件：
+  #
+  # - name: "devin-swe-2"
+  #   models:
+  #     - "devin/swe-2"
+  #     - "devin/swe-2-lightning"
+  #   source_file: "spacebunny-agents.md"
+  #   file: "upstream/devin-swe-2.md"
+  #   mode: "prepend"
