@@ -2,8 +2,31 @@
 
 > 目标机：`root@<YOUR_SERVER_IP>`（Debian 13，Docker 26.1.5 + Compose 2.26.1 已装好，镜像已预拉）
 > 部署路径：`/opt/orca-ai-pool/`
+>
+> 相关文档：[说明文档](README.md) · [技术文档](docs/TECHNICAL.md) ·
+> [容量规划](docs/capacity-planning.md)
+
+```mermaid
+flowchart LR
+    A["系统依赖"] --> B[".env / accounts.yaml"]
+    B --> C["poolctl render"]
+    C --> D["构建插件"]
+    D --> E["docker compose up"]
+    E --> F["install-nginx.sh"]
+    F --> G["模型列表 + 冒烟请求"]
+```
 
 ---
+
+## 第零步：系统依赖
+
+```bash
+sudo apt-get update
+sudo apt-get install -y nginx python3-yaml golang-go build-essential openssl
+```
+
+`python3-yaml` 是 `poolctl render` 的运行时依赖；`nginx` 提供公网入口和 TLS；
+`golang-go`/`build-essential` 用于构建 C ABI 插件（Go 1.21+）。
 
 ## 第一步：填 `.env`
 
@@ -80,8 +103,10 @@ cd plugin/jailbreak-inject && make install && cd ../..
 python3 scripts/poolctl.py render
 # 若栈已经在跑：docker compose restart cliproxyapi；首次部署直接走第 4 步
 
-# 4. 起栈（docker compose 会自动叠加 docker-compose.override.yml → 带 nginx 入口）
+# 4. 起栈
 docker compose up -d
+# 安装 nginx 入口（配置来自 render 产物；首次会生成自签证书）
+sudo bash scripts/install-nginx.sh
 
 # 5. 验证（30 秒后）
 docker compose ps      # 两个容器：cliproxyapi / opencode2api（nginx 装在宿主机上）
@@ -101,11 +126,12 @@ curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:18317/v1/models
 > `/v8/management/*`（burst 30），稳态 5 r/s per IP；插件配额端点单独 12 r/m（burst 5）。
 > **模型面 `/v1/*` 不限速、不限并发**——SSE 长流和并行子 agent 会自己放大瞬时并发，
 > 给模型面设桶最先打到的就是最该重试的请求。排障时走 `127.0.0.1:18317` 绕开入口。
+> `install-nginx.sh` 首次会生成自签证书；通过 HTTPS 访问时需信任该证书，或在临时排障时用 `curl -k`。
 
 
 - **CPAMC 管理面板**：`http://<服务器IP>:8317/management.html`，密码 = `CPA_ADMIN_SECRET`
-- **Go 多账号余量**：CPAMC 配额管理页的 `opencode-go-pool.json` 凭据卡片（只给一行聚合，
-  单 key 明细请直接看 `opencode-go-N.json` 凭据）
+- **Go 多账号余量**：CPAMC 配额管理页的 `opencode-go-pool.json` 凭据卡片；`poolctl quota`
+  的第二张表会展开每个 key 的 rolling/weekly/monthly 余量
 - **opencode2api WebUI**：`http://127.0.0.1:18081`（只绑回环，需 SSH 转发：`ssh -L 18081:127.0.0.1:18081 root@<YOUR_SERVER_IP>`），账号 `admin` / `OC2API_WEBUI_PASSWORD`
 
 ## 常用运维命令
@@ -122,7 +148,8 @@ curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:18317/v1/models
 
 ## 防火墙提醒
 
-- **8317 是唯一该放行的端口**，现在是 nginx 入口（仅管理面限速 + 429 JSON，`/v1` 纯透传）。
+- **公网放行 `8317`；启用 TLS 时同时放行 `443`**。两者都走 nginx（仅管理面限速，
+  `/v1` 纯透传）。
 - `18317` 是 CPA 的宿主机回环端口（`127.0.0.1`），只用于排障，绝不要对公网开放。
 - `18081` 已绑定 `127.0.0.1`，外部访问必须走 SSH 隧道；`8080` 未发布到宿主机。
 - 回滚到「CPA 直接对外」：把 `docker-compose.yml` 的端口改回 `"8317:8317"`、

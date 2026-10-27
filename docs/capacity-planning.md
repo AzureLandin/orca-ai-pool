@@ -2,6 +2,18 @@
 
 > 数据采集：2026-10-26 · 实测窗口 16.2 小时 · 口径为「等效 API 用量额度」，非现金。
 > 本文所有官方数字均带来源；社区的实测数字标注了时间，因为 Go 的额度结构在 2026 年 8 月、9 月改过两次。
+>
+> 相关文档：[说明文档](../README.md) · [技术文档](TECHNICAL.md) · [部署指引](../DEPLOY.md)
+
+```mermaid
+flowchart TD
+    A["缓存命中率"] --> B["单请求等效成本"]
+    B --> C["单号可承载请求数"]
+    C --> D["所需 Go 号数"]
+    E["并发 agent 数"] --> F["所需 Devin Pro 号数"]
+    D --> G["容量规划"]
+    F --> G
+```
 
 ## TL;DR
 
@@ -99,7 +111,8 @@ Go 的额度是美元窗口（官方 FAQ）：**每月 100%，每 5 小时 20%�
 | 85% | $14.2m | 5,630 | 9.6 |
 | 0%（社区翻车） | $55.8m | 1,434 | 37.6 |
 
-守住缓存的做法见 README 第 7 节：`session-affinity` 开、`prompt_cache_key` 固定在会话级、system prompt 不放时间戳。
+守住缓存的做法见[技术文档的缓存策略](TECHNICAL.md#6-缓存策略)：`session-affinity` 开、
+`prompt_cache_key` 固定在会话级、system prompt 不放时间戳。
 
 ## 4. Argon：需要几个 Devin Pro
 
